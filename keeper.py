@@ -16,9 +16,12 @@ class Keeper:
         self.channel = None
         self.data = {}
         self.replica = None
+        self.hash_ring = ConsistentHashRing() 
         self.init_rabbitmq()
         self.start_replica()
         print(f"Storage device {keeper_id} has started")
+
+        self.hash_ring.add_node(f'keeper_{keeper_id}')
 
     def init_rabbitmq(self):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
@@ -69,11 +72,14 @@ class Keeper:
             traceback.print_exc()
 
     def handle_store(self, data):
-        try:
-            date = data.get('date')
-            records = data.get('data', [])
-            column_names = data.get('column_names', [])
-            print(f"Storing data for date: {date}")
+        date = data.get('date')
+        records = data.get('data', [])
+        column_names = data.get('column_names', [])
+        
+        
+        target_keeper = self.hash_ring.get_node(date)
+        if target_keeper:
+            print(f"Storing data for date: {date} in {target_keeper}")
             self.data[date] = {
                 'data': records,
                 'column_names': column_names
@@ -83,11 +89,8 @@ class Keeper:
                 'data': records,
                 'column_names': column_names
             }))
-            print(f"Replica received data for date {date}")
-            return {'success': True}
-        except Exception as e:
-            print(f"Error processing STORE request: {e}")
-            return {'success': False, 'error': str(e)}
+        else:
+            print(f"No target keeper found for date: {date}")
 
     def handle_get(self, date_data, properties):
         try:

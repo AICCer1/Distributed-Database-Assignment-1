@@ -11,6 +11,7 @@ import uuid
 import threading
 import os
 import re
+from utils import ConsistentHashRing
 
 class Manager:
     def __init__(self, num_keepers=3):
@@ -19,6 +20,7 @@ class Manager:
         self.connection = None
         self.channel = None
         self.data_index = {}
+        self.hash_ring = ConsistentHashRing()
 
         self.init_rabbitmq()
         
@@ -52,8 +54,16 @@ class Manager:
                 [python_executable, 'keeper.py', str(i), str(self.num_keepers)]
             )
             self.keepers.append(keeper_process)
+            self.hash_ring.add_node(f'keeper_{i}')
             print(f"Starting storage device {i}")
             time.sleep(2)
+
+    def remove_keeper(self, keeper_id):
+        self.hash_ring.remove_node(f'keeper_{keeper_id}')
+        if self.keepers[keeper_id]:
+            self.keepers[keeper_id].terminate()
+            self.keepers[keeper_id] = None
+        print(f"Removed keeper {keeper_id} from the hash ring")
 
     def process_client_message(self, ch, method, properties, body):
         try:
@@ -409,7 +419,8 @@ class Manager:
         except KeyboardInterrupt:
             print("Manager is shutting down...")
             for keeper in self.keepers:
-                keeper.terminate()
+                if keeper:
+                    keeper.terminate()
             self.connection.close()
 
 if __name__ == "__main__":

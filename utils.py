@@ -2,6 +2,7 @@ import hashlib
 import json
 import csv
 import datetime
+import bisect
 
 # Constant definitions
 MANAGER_QUEUE = 'manager_queue'
@@ -50,3 +51,28 @@ def format_date(date_str):
         return datetime.datetime.strptime(date_str, '%Y-%m-%d').strftime('%d-%m-%Y')
     except ValueError:
         return date_str
+
+class ConsistentHashRing:
+    def __init__(self):
+        self.ring = []
+        self.nodes = {}
+
+    def _hash(self, key):
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+
+    def add_node(self, node):
+        self.nodes[node] = self._hash(node)
+        self.ring.append(self.nodes[node])
+        self.ring.sort()
+
+    def remove_node(self, node):
+        if node in self.nodes:
+            self.ring.remove(self.nodes[node])
+            del self.nodes[node]
+
+    def get_node(self, key):
+        if not self.ring:
+            return None
+        key_hash = self._hash(key)
+        idx = bisect.bisect(self.ring, key_hash) % len(self.ring)
+        return list(self.nodes.keys())[idx]
