@@ -153,19 +153,23 @@ class Manager:
             print(f"Grouped by date, there are {len(date_records)} different dates")
             
             for date, date_data in date_records.items():
-                keeper_id = get_keeper_id(date, self.num_keepers)
-                print(f"Date {date} assigned to storage device {keeper_id}")
-                
-                if date not in self.data_index:
-                    self.data_index[date] = []
-                if keeper_id not in self.data_index[date]:
-                    self.data_index[date].append(keeper_id)
-                
-                self.send_to_keeper(keeper_id, create_message('STORE', {
-                    'date': date,
-                    'data': date_data['data'],
-                    'column_names': date_data['column_names']
-                }))
+                keeper_queue = self.hash_ring.get_node(date)
+                if keeper_queue:
+                    keeper_id = int(keeper_queue.split('_')[1])
+                    print(f"Date {date} assigned to storage device {keeper_id} using consistent hashing")
+                    
+                    if date not in self.data_index:
+                        self.data_index[date] = []
+                    if keeper_id not in self.data_index[date]:
+                        self.data_index[date].append(keeper_id)
+                    
+                    self.send_to_keeper(keeper_id, create_message('STORE', {
+                        'date': date,
+                        'data': date_data['data'],
+                        'column_names': date_data['column_names']
+                    }))
+                else:
+                    print(f"No available keeper found for date: {date}")
             
             self.send_to_client(create_message('LOAD_RESULT', {
                 'success': True,
@@ -267,14 +271,20 @@ class Manager:
             for date_format in [standard_date, date_str]:
                 if date_format in self.data_index:
                     keeper_ids = self.data_index[date_format]
+                    print(f"Found date {date_format} in index, stored in keepers: {keeper_ids}")
                     break
             
             if not keeper_ids:
-                alt_formats = self.generate_alternative_date_formats(standard_date)
-                for alt_date in alt_formats:
-                    if alt_date in self.data_index:
-                        keeper_ids = self.data_index[alt_date]
-                        break
+                keeper_queue = self.hash_ring.get_node(standard_date)
+                if keeper_queue:
+                    keeper_id = int(keeper_queue.split('_')[1])
+                    keeper_ids = [keeper_id]
+                    print(f"Using consistent hash ring to locate data for date: {standard_date}, keeper: {keeper_id}")
+                    
+                    if standard_date not in self.data_index:
+                        self.data_index[standard_date] = []
+                    if keeper_id not in self.data_index[standard_date]:
+                        self.data_index[standard_date].append(keeper_id)
             
             if not keeper_ids:
                 print(f"No data found for date: {date_str}")
@@ -308,7 +318,10 @@ class Manager:
                 nonlocal response_received, response_data
                 response_received = True
                 response_data = body
-                temp_channel.stop_consuming()
+                try:
+                    temp_channel.stop_consuming()
+                except Exception as e:
+                    print(f"Error stopping consumption: {e}")
             
             temp_channel.basic_consume(
                 queue=temp_queue,
@@ -333,16 +346,18 @@ class Manager:
             
             print(f"Sent GET request to storage device {keeper_id}, waiting for response...")
             
+            timeout_seconds = 5  # 增加超时时间
             timeout_event = threading.Event()
             
             def timeout_thread():
-                for _ in range(50):
-                    if timeout_event.is_set():
+                start_time = time.time()
+                while time.time() - start_time < timeout_seconds:
+                    if timeout_event.is_set() or response_received:
                         return
                     time.sleep(0.1)
                 
                 if not response_received:
-                    print("Request timed out")
+                    print(f"Request timed out after {timeout_seconds} seconds")
                     try:
                         temp_channel.stop_consuming()
                     except:
@@ -353,7 +368,10 @@ class Manager:
             timer_thread.start()
             
             print("Starting to wait for response...")
-            temp_channel.start_consuming()
+            try:
+                temp_channel.start_consuming()
+            except Exception as e:
+                print(f"Error during consumption: {e}")
             print("Finished waiting for response")
             
             timeout_event.set()

@@ -16,12 +16,9 @@ class Keeper:
         self.channel = None
         self.data = {}
         self.replica = None
-        self.hash_ring = ConsistentHashRing() 
         self.init_rabbitmq()
         self.start_replica()
         print(f"Storage device {keeper_id} has started")
-
-        self.hash_ring.add_node(f'keeper_{keeper_id}')
 
     def init_rabbitmq(self):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
@@ -76,21 +73,16 @@ class Keeper:
         records = data.get('data', [])
         column_names = data.get('column_names', [])
         
-        
-        target_keeper = self.hash_ring.get_node(date)
-        if target_keeper:
-            print(f"Storing data for date: {date} in {target_keeper}")
-            self.data[date] = {
-                'data': records,
-                'column_names': column_names
-            }
-            self.send_to_replica(create_message('REPLICATE', {
-                'date': date,
-                'data': records,
-                'column_names': column_names
-            }))
-        else:
-            print(f"No target keeper found for date: {date}")
+        print(f"Storing data for date: {date}")
+        self.data[date] = {
+            'data': records,
+            'column_names': column_names
+        }
+        self.send_to_replica(create_message('REPLICATE', {
+            'date': date,
+            'data': records,
+            'column_names': column_names
+        }))
 
     def handle_get(self, date_data, properties):
         try:

@@ -46,7 +46,7 @@ class Client(cmd.Cmd):
             msg_type = message.get('type')
             data = message.get('data')
             
-            print(f"\nReceived response: {msg_type}\n")
+            print(f"\n===== Received response: {msg_type} =====")
             
             self.last_response = message
             
@@ -179,7 +179,7 @@ class Client(cmd.Cmd):
             print(f"Date parsing error: {e}")
             return
             
-        print(f"Getting data for date: {arg}...")
+        print(f"\n===== Getting data for date: {arg} =====")
         self.last_response = None
         
         try:
@@ -191,13 +191,12 @@ class Client(cmd.Cmd):
             
             print("Waiting for response...")
             for i in range(20):
-                if i % 5 == 0:
-                    print(f"Waiting for response... {i+1}/20")
+                if i % 5 == 0 and i > 0:
+                    print(f"Still waiting for response... {i}/20")
                     
                 try:
                     self.connection.process_data_events(time_limit=0.5)
                     if self.last_response and self.last_response.get('type') == 'GET_RESULT':
-                        print(f"Received response: {self.last_response}")
                         break
                 except pika.exceptions.AMQPError as e:
                     print(f"Error processing event: {e}")
@@ -208,7 +207,7 @@ class Client(cmd.Cmd):
                         break
             
             if not self.last_response or self.last_response.get('type') != 'GET_RESULT':
-                print("No response or incorrect response type received")
+                print("\n===== No response or incorrect response type received =====")
         except pika.exceptions.AMQPError as e:
             print(f"RabbitMQ error: {e}")
             print("Trying to reconnect...")
@@ -220,6 +219,8 @@ class Client(cmd.Cmd):
         except Exception as e:
             print(f"Error sending GET request: {e}")
             traceback.print_exc()
+        
+        print("\n===== GET request completed =====")
 
     def do_exit(self, arg):
         print("Exiting the program...")
