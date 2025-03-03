@@ -7,6 +7,7 @@ from utils import *
 import re
 import datetime
 import traceback
+import time
 
 def is_valid_date(year, month, day):
     try:
@@ -46,64 +47,136 @@ class Client(cmd.Cmd):
             msg_type = message.get('type')
             data = message.get('data')
             
-            print(f"\n===== Received response: {msg_type} =====")
-            
+            # 保存最后收到的响应
             self.last_response = message
             
             if msg_type == 'GET_RESULT':
+                print(f"\n===== GET results for date: {data.get('date', '')} =====")
                 if data.get('found'):
-                    records = data.get('data', [])
-                    count = data.get('count', 0)
                     date = data.get('date', '')
-                    column_names = data.get('column_names', [])
+                    count = data.get('count', 0)
                     
-                    print(f"Found {count} records for the date: {date}\n")
-                    
-                    if column_names:
-                        print("Header:")
-                        print("-" * 100)
-                        for i in range(0, len(column_names), 5):
-                            chunk = column_names[i:i+5]
-                            print(", ".join(chunk))
-                        print("-" * 100)
-                        print()
-                    
-                    try:
-                        for record_idx, record in enumerate(records):
-                            print(f"Record #{record_idx + 1}:")
-                            print("-" * 50)
+                    # 检查是否使用新的数据结构（包含datasets字段）
+                    if 'datasets' in data:
+                        datasets = data.get('datasets', [])
+                        print(f"Found {count} records in {len(datasets)} datasets for the date: {date}\n")
+                        
+                        # 遍历每个数据集
+                        for dataset_idx, dataset in enumerate(datasets):
+                            records = dataset.get('data', [])
+                            column_names = dataset.get('column_names', [])
+                            source_file = dataset.get('source_file', 'unknown')
                             
-                            if isinstance(record, list):
-                                if column_names and len(column_names) >= len(record):
-                                    for i, (name, value) in enumerate(zip(column_names, record)):
-                                        if i > 0 and i % 5 == 0:
-                                            print()
-                                        print(f"{name}: {value}", end="  ")
-                                    print("\n")
+                            print(f"\n----- Dataset #{dataset_idx + 1} from {source_file} -----")
+                            print(f"Records count: {len(records)}")
+                            
+                            if column_names and len(column_names) > 0:
+                                print("\nHeader:")
+                                print("-" * 100)
+                                for i in range(0, len(column_names), 5):
+                                    chunk = column_names[i:i+5]
+                                    print(", ".join(chunk))
+                                print("-" * 100)
+                            
+                            # 显示所有记录，不省略
+                            for record_idx, record in enumerate(records):
+                                print(f"\nRecord #{record_idx + 1}:")
+                                print("-" * 50)
+                                
+                                if isinstance(record, list):
+                                    # 使用实际的列名
+                                    if column_names and len(column_names) > 0:
+                                        for i, value in enumerate(record):
+                                            if i < len(column_names):
+                                                column_name = column_names[i]
+                                            else:
+                                                column_name = f"Column {i+1}"
+                                            
+                                            if i > 0 and i % 5 == 0:
+                                                print()
+                                            print(f"{column_name}: {value}", end="  ")
+                                        print("\n")
+                                    else:
+                                        # 如果没有列名，使用索引
+                                        for i in range(0, len(record), 5):
+                                            chunk = record[i:i+5]
+                                            formatted = ", ".join(f"[{i+j}]: {v}" for j, v in enumerate(chunk))
+                                            print(formatted)
+                                        print()
                                 else:
-                                    for i in range(0, len(record), 5):
-                                        chunk = record[i:i+5]
-                                        formatted = ", ".join(f"[{i+j}]:{v}" for j, v in enumerate(chunk))
-                                        print(formatted)
-                                    print()
-                            else:
-                                print(record)
-                            print("-" * 50)
-                    except Exception as e:
-                        print(f"Error processing response: {e}")
-                        traceback.print_exc()
+                                    print(record)
+                                print("-" * 50)
+                            
+                            print(f"----- End of Dataset #{dataset_idx + 1} -----\n")
+                    else:
+                        # 兼容旧的数据结构
+                        records = data.get('data', [])
+                        column_names = data.get('column_names', [])
+                        
+                        print(f"Found {count} records for the date: {date}\n")
+                        
+                        if column_names and len(column_names) > 0:
+                            print("Header:")
+                            print("-" * 100)
+                            for i in range(0, len(column_names), 5):
+                                chunk = column_names[i:i+5]
+                                print(", ".join(chunk))
+                            print("-" * 100)
+                            print()
+                        
+                        try:
+                            for record_idx, record in enumerate(records):
+                                print(f"Record #{record_idx + 1}:")
+                                print("-" * 50)
+                                
+                                if isinstance(record, list):
+                                    # 使用实际的列名
+                                    if column_names and len(column_names) > 0:
+                                        for i, value in enumerate(record):
+                                            if i < len(column_names):
+                                                column_name = column_names[i]
+                                            else:
+                                                column_name = f"Column {i+1}"
+                                            
+                                            if i > 0 and i % 5 == 0:
+                                                print()
+                                            print(f"{column_name}: {value}", end="  ")
+                                        print("\n")
+                                    else:
+                                        # 如果没有列名，使用索引
+                                        for i in range(0, len(record), 5):
+                                            chunk = record[i:i+5]
+                                            formatted = ", ".join(f"[{i+j}]: {v}" for j, v in enumerate(chunk))
+                                            print(formatted)
+                                        print()
+                                else:
+                                    print(record)
+                                print("-" * 50)
+                        except Exception as e:
+                            print(f"Error processing response: {e}")
+                            traceback.print_exc()
                 else:
                     date = data.get('date', '')
                     print(f"No data found for the date: {date}")
             
             elif msg_type == 'LOAD_RESULT':
+                # 不显示处理LOAD_RESULT的调试信息，只显示实际的结果
                 if data.get('success'):
                     filename = data.get('filename', '')
-                    records = data.get('records', 0)
-                    dates = data.get('dates', 0)
-                    print(f"File loaded successfully: {filename}")
-                    print(f"Total records: {records}")
-                    # print(f"Different dates count: {dates}")
+                    status = data.get('status', 'completed')
+                    
+                    # 简化进度显示，只显示开始和完成信息
+                    if status == 'started':
+                        print(f"Started loading file: {filename}")
+                    elif status == 'completed':
+                        records = data.get('records', 0)
+                        dates = data.get('dates', 0)
+                        unique_dates = data.get('unique_dates', 0)
+                        
+                        print(f"\n===== File loading completed: {filename} =====")
+                        print(f"File loaded successfully: {filename}")
+                        print(f"Total records: {records}")
+                        print(f"Unique dates: {dates}")
                 else:
                     error = data.get('error', 'Unknown error')
                     print(f"Failed to load file: {error}")
@@ -145,9 +218,41 @@ class Client(cmd.Cmd):
             return
         
         print(f"Loading file {arg}...")
+        self.last_response = None
         self.send_to_manager(create_message('LOAD', arg))
         
-        self.connection.process_data_events(time_limit=5)
+        print("Waiting for file to load completely...")
+        # 无限等待，直到收到LOAD_RESULT且状态为completed的响应
+        completed_received = False
+        while True:
+            try:
+                self.connection.process_data_events(time_limit=0.5)
+                
+                # 检查是否收到了最终的LOAD_RESULT响应
+                if (self.last_response and 
+                    self.last_response.get('type') == 'LOAD_RESULT' and 
+                    self.last_response.get('data', {}).get('status') == 'completed'):
+                    completed_received = True
+                    # 收到完成消息后，再等待1秒确保所有消息都已处理完毕
+                    time.sleep(1)
+                    break
+                    
+                # 如果收到了错误响应，也退出
+                if (self.last_response and 
+                    self.last_response.get('type') == 'LOAD_RESULT' and 
+                    not self.last_response.get('data', {}).get('success', True)):
+                    break
+                    
+            except pika.exceptions.AMQPError as e:
+                print(f"Error processing event: {e}")
+                try:
+                    self.init_rabbitmq()
+                except Exception as conn_err:
+                    print(f"Failed to reconnect: {conn_err}")
+                    break
+        
+        if completed_received:
+            print("All processing completed.")
 
     def do_GET(self, arg):
         if not arg:

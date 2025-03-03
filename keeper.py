@@ -7,6 +7,8 @@ import subprocess
 import traceback
 from utils import *
 import os
+import csv
+import socket
 
 class Keeper:
     def __init__(self, keeper_id, num_keepers):
@@ -72,16 +74,89 @@ class Keeper:
         date = data.get('date')
         records = data.get('data', [])
         column_names = data.get('column_names', [])
+        source_file = data.get('source_file', 'unknown')  # 添加文件来源信息
         
         print(f"Storing data for date: {date}")
-        self.data[date] = {
-            'data': records,
-            'column_names': column_names
-        }
+        print(f"DEBUG - Received column names: {column_names}")
+        print(f"DEBUG - Source file: {source_file}")
+        
+        # Check if data for this date already exists
+        if date in self.data:
+            # 获取现有数据
+            date_data = self.data[date]
+            
+            # 如果是旧格式（列表），转换为新格式
+            if isinstance(date_data, list):
+                date_data = {
+                    'datasets': [
+                        {
+                            'data': date_data,
+                            'column_names': [],
+                            'source_file': 'unknown'
+                        }
+                    ]
+                }
+            
+            # 如果是旧的字典格式（没有datasets字段），转换为新格式
+            elif isinstance(date_data, dict) and 'datasets' not in date_data:
+                date_data = {
+                    'datasets': [
+                        {
+                            'data': date_data.get('data', []),
+                            'column_names': date_data.get('column_names', []),
+                            'source_file': 'unknown'
+                        }
+                    ]
+                }
+            
+            # 检查是否已存在相同来源的数据集
+            found_existing_dataset = False
+            for dataset in date_data['datasets']:
+                if dataset.get('source_file') == source_file:
+                    # 已存在相同来源的数据集，更新或添加记录
+                    existing_records = dataset['data']
+                    
+                    # 添加不存在的记录
+                    for record in records:
+                        if record not in existing_records:
+                            existing_records.append(record)
+                    
+                    dataset['data'] = existing_records
+                    found_existing_dataset = True
+                    print(f"Updated existing dataset from {source_file} for date {date}. Total records: {len(existing_records)}")
+                    break
+            
+            # 如果没有找到相同来源的数据集，添加新的数据集
+            if not found_existing_dataset:
+                date_data['datasets'].append({
+                    'data': records,
+                    'column_names': column_names,
+                    'source_file': source_file
+                })
+                print(f"Added new dataset from {source_file} for date {date} with {len(records)} records")
+            
+            self.data[date] = date_data
+            
+        else:
+            # Create new entry if date doesn't exist
+            self.data[date] = {
+                'datasets': [
+                    {
+                        'data': records,
+                        'column_names': column_names,
+                        'source_file': source_file
+                    }
+                ]
+            }
+            print(f"Created new entry for date {date} with {len(records)} records from {source_file}")
+        
+        # 打印调试信息
+        print(f"DEBUG - Final data structure for date {date}: {self.data[date]}")
+            
         self.send_to_replica(create_message('REPLICATE', {
             'date': date,
-            'data': records,
-            'column_names': column_names
+            'data': self.data[date],
+            'source_file': source_file
         }))
 
     def handle_get(self, date_data, properties):
@@ -94,15 +169,39 @@ class Keeper:
                 original_date = date
             print(f"Query date: {date}")
             if date in self.data:
-                records = self.data[date].get('data', [])
-                column_names = self.data[date].get('column_names', [])
-                print(f"Found {len(records)} records")
+                date_info = self.data[date]
+                
+                # 检查数据结构
+                if isinstance(date_info, list):
+                    # 旧格式（列表），转换为新格式
+                    datasets = [{
+                        'data': date_info,
+                        'column_names': [],
+                        'source_file': 'unknown'
+                    }]
+                elif isinstance(date_info, dict) and 'datasets' in date_info:
+                    # 新格式（包含datasets字段）
+                    datasets = date_info['datasets']
+                elif isinstance(date_info, dict) and 'data' in date_info:
+                    # 中间格式（包含data字段但没有datasets字段）
+                    datasets = [{
+                        'data': date_info.get('data', []),
+                        'column_names': date_info.get('column_names', []),
+                        'source_file': 'unknown'
+                    }]
+                else:
+                    # 未知格式
+                    datasets = []
+                
+                total_records = sum(len(dataset.get('data', [])) for dataset in datasets)
+                print(f"Found {total_records} records in {len(datasets)} datasets")
+                
+                # 构建响应，包含所有数据集
                 response = {
                     'date': original_date,
                     'found': True,
-                    'data': records,
-                    'count': len(records),
-                    'column_names': column_names
+                    'datasets': datasets,
+                    'count': total_records
                 }
             else:
                 print(f"Date {date} data not found, trying to get from replica...")
@@ -113,7 +212,7 @@ class Keeper:
                     return {
                         'date': original_date,
                         'found': False,
-                        'data': [],
+                        'datasets': [],
                         'count': 0
                     }
             reply_to = properties.reply_to if properties else None
@@ -141,7 +240,7 @@ class Keeper:
             response = {
                 'date': date_data.get('date', ''),
                 'found': False,
-                'data': [],
+                'datasets': [],
                 'count': 0,
                 'error': str(e)
             }
@@ -158,22 +257,46 @@ class Keeper:
             original_date = data.get('original_date', date)
             print(f"Query date: {date}")
             if date in self.data:
-                records = self.data[date].get('data', [])
-                column_names = self.data[date].get('column_names', [])
-                print(f"Found {len(records)} records")
+                date_info = self.data[date]
+                
+                # 检查数据结构
+                if isinstance(date_info, list):
+                    # 旧格式（列表），转换为新格式
+                    datasets = [{
+                        'data': date_info,
+                        'column_names': [],
+                        'source_file': 'unknown'
+                    }]
+                elif isinstance(date_info, dict) and 'datasets' in date_info:
+                    # 新格式（包含datasets字段）
+                    datasets = date_info['datasets']
+                elif isinstance(date_info, dict) and 'data' in date_info:
+                    # 中间格式（包含data字段但没有datasets字段）
+                    datasets = [{
+                        'data': date_info.get('data', []),
+                        'column_names': date_info.get('column_names', []),
+                        'source_file': 'unknown'
+                    }]
+                else:
+                    # 未知格式
+                    datasets = []
+                
+                total_records = sum(len(dataset.get('data', [])) for dataset in datasets)
+                print(f"Found {total_records} records in {len(datasets)} datasets")
+                
+                # 构建响应，包含所有数据集
                 response = {
                     'date': original_date,
                     'found': True,
-                    'data': records,
-                    'count': len(records),
-                    'column_names': column_names
+                    'datasets': datasets,
+                    'count': total_records
                 }
             else:
                 print(f"Date {date} data not found")
                 response = {
                     'date': original_date,
                     'found': False,
-                    'data': [],
+                    'datasets': [],
                     'count': 0
                 }
             print(f"Storage device {self.keeper_id} directly sending response to client")
@@ -191,7 +314,7 @@ class Keeper:
             response = {
                 'date': data.get('date', ''),
                 'found': False,
-                'data': [],
+                'datasets': [],
                 'count': 0,
                 'error': str(e)
             }
@@ -209,22 +332,46 @@ class Keeper:
             response_queue = data.get('response_queue')
             print(f"Query date: {date}")
             if date in self.data:
-                records = self.data[date].get('data', [])
-                column_names = self.data[date].get('column_names', [])
-                print(f"Found {len(records)} records")
+                date_info = self.data[date]
+                
+                # 检查数据结构
+                if isinstance(date_info, list):
+                    # 旧格式（列表），转换为新格式
+                    datasets = [{
+                        'data': date_info,
+                        'column_names': [],
+                        'source_file': 'unknown'
+                    }]
+                elif isinstance(date_info, dict) and 'datasets' in date_info:
+                    # 新格式（包含datasets字段）
+                    datasets = date_info['datasets']
+                elif isinstance(date_info, dict) and 'data' in date_info:
+                    # 中间格式（包含data字段但没有datasets字段）
+                    datasets = [{
+                        'data': date_info.get('data', []),
+                        'column_names': date_info.get('column_names', []),
+                        'source_file': 'unknown'
+                    }]
+                else:
+                    # 未知格式
+                    datasets = []
+                
+                total_records = sum(len(dataset.get('data', [])) for dataset in datasets)
+                print(f"Found {total_records} records in {len(datasets)} datasets")
+                
+                # 构建响应，包含所有数据集
                 response = {
                     'date': original_date,
                     'found': True,
-                    'data': records,
-                    'count': len(records),
-                    'column_names': column_names
+                    'datasets': datasets,
+                    'count': total_records
                 }
             else:
                 print(f"Date {date} data not found")
                 response = {
                     'date': original_date,
                     'found': False,
-                    'data': [],
+                    'datasets': [],
                     'count': 0
                 }
             print(f"Storage device {self.keeper_id} sending response to queue: {response_queue}")
@@ -242,7 +389,7 @@ class Keeper:
             response = {
                 'date': data.get('date', ''),
                 'found': False,
-                'data': [],
+                'datasets': [],
                 'count': 0,
                 'error': str(e)
             }
@@ -301,6 +448,150 @@ class Keeper:
             if self.replica:
                 self.replica.terminate()
             self.connection.close()
+
+    def load_data(self, filename):
+        try:
+            with open(os.path.join(self.data_dir, filename), 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)  # Read the header row
+                date_column = header.index('date')
+                
+                # 打印调试信息
+                print(f"Before loading {filename}, data structure: {type(self.data)}")
+                print(f"CSV Header: {header}")
+                if '2015-01-01' in self.data:
+                    print(f"Before loading, data for 2015-01-01: {self.data['2015-01-01']}")
+                
+                # 确保 self.data 是字典
+                if not isinstance(self.data, dict):
+                    self.data = {}
+                
+                # 加载数据
+                for row in reader:
+                    date = row[date_column]
+                    
+                    # 将行转换为列表，确保一致性
+                    row_list = list(row)
+                    
+                    # 检查日期是否已存在
+                    if date not in self.data:
+                        # 创建新的日期条目，包含数据和列名
+                        self.data[date] = {
+                            'data': [row_list],
+                            'column_names': header
+                        }
+                    else:
+                        # 如果日期已存在，检查数据结构
+                        if isinstance(self.data[date], list):
+                            # 旧格式，转换为新格式
+                            existing_rows = self.data[date]
+                            self.data[date] = {
+                                'data': existing_rows + [row_list],
+                                'column_names': header
+                            }
+                        else:
+                            # 新格式，检查记录是否已存在
+                            existing_records = self.data[date]['data']
+                            row_exists = False
+                            for existing_row in existing_records:
+                                if existing_row == row_list:
+                                    row_exists = True
+                                    break
+                            
+                            # 只添加不存在的记录
+                            if not row_exists:
+                                existing_records.append(row_list)
+                
+                # 打印调试信息
+                if '2015-01-01' in self.data:
+                    print(f"After loading {filename}, data for 2015-01-01: {self.data['2015-01-01']}")
+                
+                # 更新版本号并通知副本
+                self.version += 1
+                self.notify_replicas()
+                return f"Loaded {filename} successfully"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Error loading {filename}: {str(e)}"
+
+    def notify_replicas(self):
+        for replica_port in self.replicas:
+            try:
+                replica_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                replica_socket.connect(('localhost', replica_port))
+                
+                # 确保数据可以被正确序列化
+                serializable_data = {}
+                for date, date_data in self.data.items():
+                    if isinstance(date_data, list):
+                        # 旧格式
+                        serializable_data[date] = {
+                            'data': [list(row) for row in date_data],
+                            'column_names': []  # 没有列名
+                        }
+                    else:
+                        # 新格式
+                        serializable_data[date] = {
+                            'data': [list(row) for row in date_data['data']],
+                            'column_names': date_data['column_names']
+                        }
+                
+                # 打印调试信息
+                print(f"Sending data to replica: {serializable_data.keys()}")
+                if '2015-01-01' in serializable_data:
+                    print(f"Sending data for 2015-01-01: {serializable_data['2015-01-01']}")
+                
+                message = json.dumps({"type": "update", "data": serializable_data, "version": self.version})
+                send_message(replica_socket, message)
+                response = receive_message(replica_socket)
+                replica_socket.close()
+                print(f"Notified replica on port {replica_port}: {response}")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Failed to notify replica on port {replica_port}: {str(e)}")
+
+    def get_data(self, date):
+        # 打印调试信息
+        print(f"get_data called for date: {date}")
+        print(f"data structure: {type(self.data)}")
+        if date in self.data:
+            date_data = self.data[date]
+            print(f"data for {date}: {date_data}")
+            
+            # 检查数据结构
+            if isinstance(date_data, list):
+                # 旧格式，转换为新格式
+                return {
+                    'data': date_data,
+                    'column_names': []  # 没有列名
+                }
+            else:
+                # 新格式，直接返回
+                return date_data
+        else:
+            print(f"No data found for date: {date}")
+            return None
+
+    def get_all_data(self):
+        # 确保数据可以被正确序列化
+        serializable_data = {}
+        for date, date_data in self.data.items():
+            if isinstance(date_data, list):
+                # 旧格式
+                serializable_data[date] = {
+                    'data': [list(row) for row in date_data],
+                    'column_names': []  # 没有列名
+                }
+            else:
+                # 新格式
+                serializable_data[date] = {
+                    'data': [list(row) for row in date_data['data']],
+                    'column_names': date_data['column_names']
+                }
+        
+        return json.dumps({"data": serializable_data, "version": self.version})
 
 if __name__ == "__main__":
     print(f"Starting storage device process: {os.getpid()}")

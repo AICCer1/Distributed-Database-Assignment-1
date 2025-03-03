@@ -102,6 +102,14 @@ class Manager:
             date_column = None
             column_names = []
             
+            # 发送开始加载的通知
+            self.send_to_client(create_message('LOAD_RESULT', {
+                'success': True,
+                'filename': full_path,
+                'status': 'started',
+                'message': f"Started loading file: {filename}"
+            }))
+            
             with open(full_path, 'r', encoding='utf-8') as f:
                 try:
                     reader = csv.reader(f)
@@ -117,9 +125,26 @@ class Manager:
                     
                     print(f"Identified date column: {header[date_column]}")
                     
+                    # 读取所有记录
+                    record_count = 0
+                    progress_interval = 1000  # 每处理1000条记录发送一次进度通知
+                    
                     for row in reader:
                         if len(row) > date_column:
                             records.append(row)
+                            record_count += 1
+                            
+                            # 定期发送进度通知
+                            if record_count % progress_interval == 0:
+                                print(f"Processed {record_count} records so far")
+                                self.send_to_client(create_message('LOAD_RESULT', {
+                                    'success': True,
+                                    'filename': full_path,
+                                    'status': 'progress',
+                                    'records_processed': record_count,
+                                    'message': f"Processing file: {filename}, records processed: {record_count}"
+                                }))
+                                
                 except Exception as e:
                     print(f"Error reading CSV file: {e}")
                     self.send_to_client(create_message('LOAD_RESULT', 
@@ -127,6 +152,15 @@ class Manager:
                     return
             
             print(f"Read {len(records)} records")
+            
+            # 发送记录读取完成的通知
+            self.send_to_client(create_message('LOAD_RESULT', {
+                'success': True,
+                'filename': full_path,
+                'status': 'records_read',
+                'records': len(records),
+                'message': f"Read {len(records)} records from file: {filename}"
+            }))
             
             date_records = {}
             for record in records:
@@ -138,25 +172,56 @@ class Manager:
                         if standard_date not in date_records:
                             date_records[standard_date] = {
                                 'data': [],
-                                'column_names': column_names
+                                'column_names': column_names,
+                                'source_file': filename
                             }
                         date_records[standard_date]['data'].append(record)
                         
-                        alt_formats = self.generate_alternative_date_formats(standard_date)
-                        for alt_date in alt_formats:
-                            if alt_date not in date_records:
-                                date_records[alt_date] = date_records[standard_date]
+                        # 完全禁用替代日期格式的生成
+                        # alt_formats = self.generate_alternative_date_formats(standard_date)
+                        # for alt_date in alt_formats:
+                        #     if alt_date not in date_records:
+                        #         date_records[alt_date] = date_records[standard_date]
                 except Exception as e:
                     print(f"Error processing date {date_str}: {e}")
                     continue
             
             print(f"Grouped by date, there are {len(date_records)} different dates")
             
+            # Count unique calendar dates (without alternative formats)
+            unique_calendar_dates = set()
+            for date_str in date_records.keys():
+                if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+                    unique_calendar_dates.add(date_str)
+            
+            # 计算实际的日期格式条目数（不包括替代格式）
+            actual_date_entries = len(unique_calendar_dates)
+            total_date_entries = len(date_records)
+            alternative_formats_count = total_date_entries - actual_date_entries
+            
+            print(f"Actual unique dates: {actual_date_entries}")
+            print(f"Total date entries including alternative formats: {total_date_entries}")
+            print(f"Alternative format entries: {alternative_formats_count}")
+            
+            # 发送日期分组完成的通知
+            self.send_to_client(create_message('LOAD_RESULT', {
+                'success': True,
+                'filename': full_path,
+                'status': 'dates_grouped',
+                'records': len(records),
+                'dates': actual_date_entries,  # 使用实际日期数
+                'message': f"Grouped {len(records)} records into {actual_date_entries} unique dates"
+            }))
+            
+            # 发送数据到keeper
+            dates_processed = 0
+            total_dates = len(date_records)
+            print(f"Starting to send data to keepers, total dates to process: {total_dates}")
+            
             for date, date_data in date_records.items():
                 keeper_queue = self.hash_ring.get_node(date)
                 if keeper_queue:
                     keeper_id = int(keeper_queue.split('_')[1])
-                    print(f"Date {date} assigned to storage device {keeper_id} using consistent hashing")
                     
                     if date not in self.data_index:
                         self.data_index[date] = []
@@ -166,17 +231,31 @@ class Manager:
                     self.send_to_keeper(keeper_id, create_message('STORE', {
                         'date': date,
                         'data': date_data['data'],
-                        'column_names': date_data['column_names']
+                        'column_names': date_data['column_names'],
+                        'source_file': filename
                     }))
+                    
+                    dates_processed += 1
+                    # 每处理100个日期发送一次进度通知，但不打印太多信息
+                    if dates_processed % 100 == 0:
+                        progress_percent = (dates_processed / total_dates) * 100
+                        print(f"Progress: {progress_percent:.1f}% - Processed {dates_processed}/{total_dates} dates")
                 else:
                     print(f"No available keeper found for date: {date}")
             
+            print(f"All data sent to keepers. Processed {dates_processed}/{total_dates} dates")
+            
+            # 发送最终完成的通知
+            print(f"Sending completion notification to client for file: {filename}")
             self.send_to_client(create_message('LOAD_RESULT', {
                 'success': True,
                 'filename': full_path,
+                'status': 'completed',
                 'records': len(records),
-                'dates': len(date_records)
+                'dates': actual_date_entries,  # 使用实际日期数
+                'message': f"File loaded successfully: {filename}"
             }))
+            print(f"Load operation completed for file: {filename}")
             
         except Exception as e:
             print(f"Error processing LOAD command: {e}")
@@ -240,9 +319,10 @@ class Manager:
         try:
             year, month, day = map(int, standard_date.split('-'))
             
+            # 只生成一种替代格式，减少重复计数
             formats = [
-                f"{day:02d}-{month:02d}-{year:04d}",
-                f"{year:04d}{month:02d}{day:02d}"
+                f"{day:02d}-{month:02d}-{year:04d}"
+                # 移除YYYYMMDD格式，减少重复计数
             ]
             
             return formats
@@ -258,13 +338,13 @@ class Manager:
                 empty_response = {
                     'date': date_str,
                     'found': False,
-                    'data': [],
+                    'datasets': [],
                     'count': 0
                 }
                 self.send_to_client(create_message('GET_RESULT', empty_response))
                 return
             
-            print(f"Standardized date: {date_str}, original format: {date_str}")
+            print(f"Standardized date: {standard_date}, original format: {date_str}")
             
             keeper_ids = []
             
@@ -293,7 +373,7 @@ class Manager:
                 empty_response = {
                     'date': date_str,
                     'found': False,
-                    'data': [],
+                    'datasets': [],
                     'count': 0
                 }
                 self.send_to_client(create_message('GET_RESULT', empty_response))
@@ -385,12 +465,28 @@ class Manager:
                 response_content = response_message.get('data', {})
                 
                 if response_type == 'GET_RESULT' and response_content.get('found'):
-                    data = response_content.get('data', [])
-                    if data and isinstance(data[0], list) and isinstance(data[0][0], list):
-                        flat_data = []
-                        for group in data:
-                            flat_data.extend(group)
-                        response_content['data'] = flat_data
+                    if 'datasets' in response_content:
+                        print(f"DEBUG - Received response with datasets structure")
+                        pass
+                    else:
+                        data = response_content.get('data', [])
+                        column_names = response_content.get('column_names', [])
+                        
+                        if data and isinstance(data[0], list) and isinstance(data[0][0], list):
+                            flat_data = []
+                            for group in data:
+                                flat_data.extend(group)
+                            data = flat_data
+                        
+                        response_content['datasets'] = [{
+                            'data': data,
+                            'column_names': column_names,
+                            'source_file': 'unknown'
+                        }]
+                        if 'data' in response_content:
+                            del response_content['data']
+                        if 'column_names' in response_content:
+                            del response_content['column_names']
                 
                 self.send_to_client(create_message(response_type, response_content))
             else:
@@ -398,7 +494,7 @@ class Manager:
                 empty_response = {
                     'date': date_str,
                     'found': False,
-                    'data': [],
+                    'datasets': [],
                     'count': 0
                 }
                 self.send_to_client(create_message('GET_RESULT', empty_response))
@@ -410,7 +506,7 @@ class Manager:
             error_response = {
                 'date': date_str,
                 'found': False,
-                'data': [],
+                'datasets': [],
                 'count': 0,
                 'error': str(e)
             }
@@ -440,6 +536,54 @@ class Manager:
                 if keeper:
                     keeper.terminate()
             self.connection.close()
+
+    def process_query(self, query):
+        if query.startswith("LOAD"):
+            filename = query.split(" ")[1]
+            if self.keeper_alive:
+                return self.keeper.load_data(filename)
+            else:
+                return "Keeper is not available"
+        elif query.startswith("GET"):
+            date = query.split(" ")[1]
+            
+            # 打印调试信息
+            print(f"Processing GET query for date: {date}")
+            
+            if self.keeper_alive:
+                data = self.keeper.get_data(date)
+                print(f"Data from keeper: {data}")
+            else:
+                # 尝试从可用的副本获取数据
+                data = None
+                for replica in self.replicas:
+                    if replica.is_alive():
+                        data = replica.get_data(date)
+                        print(f"Data from replica: {data}")
+                        if data:
+                            break
+                else:
+                    return "No available replicas or data not found"
+            
+            # 处理返回的多条记录
+            if not data:
+                return f"No data found for date {date}"
+            else:
+                # 格式化多条记录的返回结果
+                result = f"Data for {date}:\n"
+                for i, record in enumerate(data):
+                    result += f"Record {i+1}: {','.join(record)}\n"
+                return result
+        elif query.startswith("ADD"):
+            parts = query.split(" ")
+            date = parts[1]
+            values = parts[2:]
+            if self.keeper_alive:
+                return self.keeper.add_data(date, values)
+            else:
+                return "Keeper is not available"
+        else:
+            return "Unknown query"
 
 if __name__ == "__main__":
     num_keepers = int(sys.argv[1]) if len(sys.argv) > 1 else 3
