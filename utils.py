@@ -8,16 +8,6 @@ import bisect
 MANAGER_QUEUE = 'manager_queue'
 CLIENT_QUEUE = 'client_queue'
 
-# Consistent hashing function
-def hash_key(key, total_slots=1024):
-    hash_obj = hashlib.md5(str(key).encode())
-    return int(hash_obj.hexdigest(), 16) % total_slots
-
-def get_keeper_id(key, num_keepers):
-
-    hash_value = hash_key(key)
-    return hash_value % num_keepers
-
 def create_message(msg_type, data=None):
     return json.dumps({
         'type': msg_type,
