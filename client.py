@@ -55,6 +55,10 @@ class Client(cmd.Cmd):
                 if data.get('found'):
                     date = data.get('date', '')
                     count = data.get('count', 0)
+                    keeper_id = data.get('keeper_id', 'unknown')
+                    
+                    # 显示数据来自哪个keeper节点
+                    print(f"Data from keeper node: {keeper_id}")
                     
                     # 检查是否使用新的数据结构（包含datasets字段）
                     if 'datasets' in data:
@@ -157,7 +161,10 @@ class Client(cmd.Cmd):
                             traceback.print_exc()
                 else:
                     date = data.get('date', '')
+                    error_msg = data.get('error', 'No data found')
                     print(f"No data found for the date: {date}")
+                    if 'error' in data:
+                        print(f"Error: {error_msg}")
             
             elif msg_type == 'LOAD_RESULT':
                 # 不显示处理LOAD_RESULT的调试信息，只显示实际的结果
