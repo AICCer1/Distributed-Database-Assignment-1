@@ -51,10 +51,21 @@ class Replica:
                 self.handle_store(data)
             elif msg_type == 'GET':
                 response = self.handle_get(data)
-                self.channel.basic_publish(
-                    exchange='',
-                    routing_key=properties.reply_to,
-                    body=json.dumps(response))
+                if properties and properties.reply_to:
+                    try:
+                        self.channel.basic_publish(
+                            exchange='',
+                            routing_key=properties.reply_to,
+                            properties=pika.BasicProperties(
+                                correlation_id=properties.correlation_id if properties.correlation_id else None
+                            ),
+                            body=json.dumps(response))
+                        self.log(f"Replica {self.keeper_id} sent response to {properties.reply_to}")
+                    except Exception as e:
+                        self.log(f"Error sending response to {properties.reply_to}: {e}", True)
+                        traceback.print_exc()
+                else:
+                    self.log(f"Replica {self.keeper_id} cannot reply to GET request: no reply_to queue provided", True)
             elif msg_type == 'REPLICATE':
                 self.handle_replicate(data)
             elif msg_type == 'GET_ALL_DATA':
@@ -106,7 +117,24 @@ class Replica:
         self.log(f"Replica {self.keeper_id} stored data for date {date}")
 
     def handle_get(self, data):
-        date = data.get('date')
+        # 添加对data参数的检查
+        if data is None:
+            self.log(f"Replica {self.keeper_id} received GET request with None data")
+            return {'found': False, 'error': 'Invalid request format'}
+            
+        # 检查data是否是字典或字符串
+        if isinstance(data, str):
+            date = data
+        elif isinstance(data, dict):
+            date = data.get('date')
+        else:
+            self.log(f"Replica {self.keeper_id} received GET request with invalid data type: {type(data)}")
+            return {'found': False, 'error': f'Invalid data type: {type(data)}'}
+            
+        if not date:
+            self.log(f"Replica {self.keeper_id} received GET request without date")
+            return {'found': False, 'error': 'No date provided'}
+            
         self.log(f"Replica querying date: {date}")
 
         if date in self.data:
@@ -127,44 +155,42 @@ class Replica:
             date = data.get('date')
             source_file = data.get('source_file', 'unknown')
             
+            # 检查是否是从迁移过来的数据，可能包含完整的数据结构
+            if source_file == 'migration' and isinstance(data.get('data'), dict):
+                self.log(f"Received migrated data with complete structure for date {date}")
+                
+                # 直接使用迁移过来的完整数据结构，不做任何修改
+                if 'datasets' in data.get('data'):
+                    self.log(f"Using complete datasets structure with {len(data.get('data')['datasets'])} datasets")
+                    self.data[date] = data.get('data')
+                else:
+                    # 如果没有datasets字段，但有其他数据，创建一个datasets结构
+                    self.log(f"Creating datasets structure for migrated data")
+                    self.data[date] = {
+                        'datasets': []
+                    }
+                    
+                    # 如果有data字段，添加为一个数据集
+                    if 'data' in data.get('data'):
+                        self.data[date]['datasets'].append({
+                            'data': data.get('data')['data'],
+                            'column_names': data.get('data').get('column_names', []),
+                            'source_file': data.get('data').get('source_file', source_file)
+                        })
+                        self.log(f"Added dataset with {len(data.get('data')['data'])} records")
+                
+                self.log(f"Replica storage complete, date: {date}, using complete structure")
+                return {'success': True}
+            
             # 检查数据结构
             if isinstance(data.get('data'), dict) and 'datasets' in data.get('data'):
                 # 新格式（包含datasets字段）
                 datasets = data.get('data').get('datasets', [])
                 self.log(f"Replicating data with datasets structure for date {date}")
                 
-                # 初始化数据结构
-                if date not in self.data:
-                    self.data[date] = {
-                        'data': [],
-                        'column_names': [],
-                        'source_file': source_file
-                    }
-                
-                # 合并所有数据集的记录
-                for dataset in datasets:
-                    records = dataset.get('data', [])
-                    column_names = dataset.get('column_names', [])
-                    
-                    # 如果当前数据集有列名但replica没有，使用这个列名
-                    if not self.data[date].get('column_names') and column_names:
-                        self.data[date]['column_names'] = column_names
-                    
-                    # 添加记录
-                    for record in records:
-                        # 使用字符串表示来检查记录是否已存在
-                        record_str = str(record)
-                        record_exists = False
-                        
-                        for existing_record in self.data[date]['data']:
-                            if str(existing_record) == record_str:
-                                record_exists = True
-                                break
-                        
-                        if not record_exists:
-                            self.data[date]['data'].append(record)
-                
-                self.log(f"Replica storage complete, date: {date}, total record count: {len(self.data[date]['data'])}")
+                # 直接使用完整的数据结构
+                self.data[date] = data.get('data')
+                self.log(f"Replica storage complete, date: {date}, with {len(datasets)} datasets")
             else:
                 # 旧格式
                 records = data.get('data', [])
@@ -191,23 +217,57 @@ class Replica:
         self.log(f"Replica {self.keeper_id} received request for all data")
         
         try:
-            # 确保数据是可序列化的
+            # 确保数据是可序列化的，同时保持完整的数据结构
             serializable_data = {}
             for date, date_data in self.data.items():
+                # 打印调试信息
+                self.log(f"Processing date {date}, data type: {type(date_data)}")
+                
                 if isinstance(date_data, dict):
-                    # 复制数据，确保不修改原始数据
-                    serializable_data[date] = {
-                        'data': date_data.get('data', []),
-                        'column_names': date_data.get('column_names', []),
-                        'source_file': date_data.get('source_file', 'unknown')
-                    }
+                    if 'datasets' in date_data:
+                        # 如果已经是新格式（包含datasets字段），直接使用
+                        self.log(f"Date {date} already has datasets structure with {len(date_data['datasets'])} datasets")
+                        serializable_data[date] = date_data
+                    elif 'data' in date_data:
+                        # 如果是中间格式（包含data字段但没有datasets字段），转换为新格式
+                        self.log(f"Converting date {date} from intermediate format to datasets format")
+                        serializable_data[date] = {
+                            'datasets': [{
+                                'data': date_data.get('data', []),
+                                'column_names': date_data.get('column_names', []),
+                                'source_file': date_data.get('source_file', 'unknown')
+                            }]
+                        }
+                    else:
+                        # 其他字典格式，尝试转换
+                        self.log(f"Converting date {date} from other dict format to datasets format")
+                        serializable_data[date] = {
+                            'datasets': [{
+                                'data': [],
+                                'column_names': [],
+                                'source_file': 'unknown'
+                            }]
+                        }
+                        for key, value in date_data.items():
+                            if key not in ['datasets']:
+                                serializable_data[date]['datasets'][0][key] = value
                 else:
                     # 如果是旧格式（列表），转换为新格式
+                    self.log(f"Converting date {date} from list format to datasets format")
                     serializable_data[date] = {
-                        'data': date_data,
-                        'column_names': [],
-                        'source_file': 'unknown'
+                        'datasets': [{
+                            'data': date_data if isinstance(date_data, list) else [],
+                            'column_names': [],
+                            'source_file': 'unknown'
+                        }]
                     }
+            
+            # 打印最终数据结构的摘要
+            for date, date_data in serializable_data.items():
+                if 'datasets' in date_data:
+                    self.log(f"Final structure for date {date}: {len(date_data['datasets'])} datasets")
+                    for i, dataset in enumerate(date_data['datasets']):
+                        self.log(f"  Dataset {i+1}: {len(dataset.get('data', []))} records, source: {dataset.get('source_file', 'unknown')}")
             
             # 准备响应
             response = {

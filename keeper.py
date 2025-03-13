@@ -10,6 +10,7 @@ import os
 import csv
 import socket
 import argparse
+import uuid
 
 class Keeper:
     def __init__(self, keeper_id, num_keepers, verbose=False):
@@ -70,10 +71,31 @@ class Keeper:
                 self.handle_store(data)
                 self.send_to_replica(body)
             elif msg_type == 'GET':
-                if isinstance(data, dict) and 'response_queue' in data:
-                    self.handle_get_with_queue(data)
+                # 添加对data参数的检查
+                if data is None:
+                    self.log(f"Keeper {self.keeper_id} received GET request with None data", True)
+                    if properties and properties.reply_to:
+                        response = {
+                            'date': '',
+                            'found': False,
+                            'datasets': [],
+                            'count': 0,
+                            'error': 'Invalid request format'
+                        }
+                        self.channel.basic_publish(
+                            exchange='',
+                            routing_key=properties.reply_to,
+                            properties=pika.BasicProperties(
+                                correlation_id=properties.correlation_id
+                            ),
+                            body=create_message('GET_RESULT', response)
+                        )
                 else:
-                    self.handle_get(data, properties)
+                    if isinstance(data, dict) and 'response_queue' in data:
+                        self.handle_get_with_queue(data)
+                    else:
+                        self.handle_get(data, properties.reply_to if properties else None, 
+                                      properties.correlation_id if properties else None)
             elif msg_type == 'GET_DIRECT':
                 self.handle_get_direct(data)
             elif msg_type == 'HEALTH_CHECK':
@@ -94,6 +116,39 @@ class Keeper:
         self.log(f"DEBUG - Received column names: {column_names}")
         self.log(f"DEBUG - Source file: {source_file}")
         
+        # 检查是否是从迁移过来的数据，可能包含完整的数据结构
+        if source_file == 'migration' and isinstance(records, dict):
+            self.log(f"Received migrated data with complete structure for date {date}")
+            
+            # 直接使用迁移过来的完整数据结构，不做任何修改
+            if 'datasets' in records:
+                self.log(f"Using complete datasets structure with {len(records['datasets'])} datasets")
+                self.data[date] = records
+            else:
+                # 如果没有datasets字段，但有其他数据，创建一个datasets结构
+                self.log(f"Creating datasets structure for migrated data")
+                self.data[date] = {
+                    'datasets': []
+                }
+                
+                # 如果有data字段，添加为一个数据集
+                if 'data' in records:
+                    self.data[date]['datasets'].append({
+                        'data': records['data'],
+                        'column_names': records.get('column_names', []),
+                        'source_file': records.get('source_file', source_file)
+                    })
+                    self.log(f"Added dataset with {len(records['data'])} records")
+            
+            # 发送到replica
+            self.send_to_replica(create_message('REPLICATE', {
+                'date': date,
+                'data': self.data[date],
+                'source_file': source_file
+            }))
+            return
+        
+        # 正常处理数据
         # Check if data for this date already exists
         if date in self.data:
             # 获取现有数据
@@ -173,15 +228,12 @@ class Keeper:
             'source_file': source_file
         }))
 
-    def handle_get(self, date_data, properties):
+    def handle_get(self, data, reply_to=None, correlation_id=None):
         try:
-            if isinstance(date_data, dict):
-                date = date_data.get('date', '')
-                original_date = date_data.get('original_date', date)
-            else:
-                date = date_data
-                original_date = date
-            self.log(f"Query date: {date}")
+            date = data.get('date')
+            original_date = data.get('original_date', date)
+            self.log(f"Querying date: {date}, original format: {original_date}")
+            
             if date in self.data:
                 date_info = self.data[date]
                 
@@ -201,7 +253,7 @@ class Keeper:
                     datasets = [{
                         'data': date_info.get('data', []),
                         'column_names': date_info.get('column_names', []),
-                        'source_file': 'unknown'
+                        'source_file': date_info.get('source_file', 'unknown')
                     }]
                 else:
                     # 未知格式
@@ -215,25 +267,30 @@ class Keeper:
                     'date': original_date,
                     'found': True,
                     'datasets': datasets,
-                    'count': total_records
+                    'count': total_records,
+                    'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                 }
             else:
                 self.log(f"Date {date} data not found, trying to get from replica...")
                 replica_data = self.get_data_from_replica(date)
                 if replica_data:
-                    return replica_data
+                    # 确保添加keeper_id到响应中
+                    if isinstance(replica_data, dict):
+                        replica_data['keeper_id'] = self.keeper_id
+                    response = replica_data
                 else:
-                    return {
+                    response = {
                         'date': original_date,
                         'found': False,
                         'datasets': [],
-                        'count': 0
+                        'count': 0,
+                        'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                     }
-            reply_to = properties.reply_to if properties else None
-            correlation_id = properties.correlation_id if properties else None
+            
             if not reply_to:
                 self.log(f"Storage device {self.keeper_id} did not receive reply_to attribute, cannot reply")
-                return
+                return response
+                
             self.log(f"Storage device {self.keeper_id} will reply to queue: {reply_to}, correlation_id: {correlation_id}")
             self.log(f"Storage device {self.keeper_id} current data: {list(self.data.keys())[:5]}...")
             self.log(f"Storage device {self.keeper_id} sending response to queue: {reply_to}")
@@ -248,22 +305,31 @@ class Keeper:
                 body=response_message
             )
             self.log(f"Storage device {self.keeper_id} sent response to queue {reply_to}")
+            return response
+            
         except Exception as e:
-            self.log(f"Error processing GET request: {e}", True)
+            self.log(f"Error in handle_get: {e}", True)
             traceback.print_exc()
-            response = {
-                'date': date_data.get('date', ''),
+            error_response = {
+                'date': data.get('date', ''),
                 'found': False,
                 'datasets': [],
                 'count': 0,
-                'error': str(e)
+                'error': str(e),
+                'keeper_id': self.keeper_id  # 添加keeper_id到错误响应中
             }
-            self.channel.basic_publish(
-                exchange='',
-                routing_key=reply_to,
-                body=create_message('GET_RESULT', response)
-            )
-            self.log(f"Storage device {self.keeper_id} sent response to queue {reply_to}")
+            
+            if reply_to:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=correlation_id
+                    ),
+                    body=create_message('GET_RESULT', error_response)
+                )
+                
+            return error_response
 
     def handle_get_direct(self, data):
         try:
@@ -289,7 +355,7 @@ class Keeper:
                     datasets = [{
                         'data': date_info.get('data', []),
                         'column_names': date_info.get('column_names', []),
-                        'source_file': 'unknown'
+                        'source_file': date_info.get('source_file', 'unknown')
                     }]
                 else:
                     # 未知格式
@@ -303,7 +369,8 @@ class Keeper:
                     'date': original_date,
                     'found': True,
                     'datasets': datasets,
-                    'count': total_records
+                    'count': total_records,
+                    'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                 }
             else:
                 self.log(f"Date {date} data not found")
@@ -311,7 +378,8 @@ class Keeper:
                     'date': original_date,
                     'found': False,
                     'datasets': [],
-                    'count': 0
+                    'count': 0,
+                    'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                 }
             self.log(f"Storage device {self.keeper_id} directly sending response to client")
             response_message = create_message('GET_RESULT', response)
@@ -330,7 +398,8 @@ class Keeper:
                 'found': False,
                 'datasets': [],
                 'count': 0,
-                'error': str(e)
+                'error': str(e),
+                'keeper_id': self.keeper_id  # 添加keeper_id到错误响应中
             }
             self.channel.basic_publish(
                 exchange='',
@@ -364,7 +433,7 @@ class Keeper:
                     datasets = [{
                         'data': date_info.get('data', []),
                         'column_names': date_info.get('column_names', []),
-                        'source_file': 'unknown'
+                        'source_file': date_info.get('source_file', 'unknown')
                     }]
                 else:
                     # 未知格式
@@ -378,7 +447,8 @@ class Keeper:
                     'date': original_date,
                     'found': True,
                     'datasets': datasets,
-                    'count': total_records
+                    'count': total_records,
+                    'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                 }
             else:
                 self.log(f"Date {date} data not found")
@@ -386,7 +456,8 @@ class Keeper:
                     'date': original_date,
                     'found': False,
                     'datasets': [],
-                    'count': 0
+                    'count': 0,
+                    'keeper_id': self.keeper_id  # 添加keeper_id到响应中
                 }
             self.log(f"Storage device {self.keeper_id} sending response to queue: {response_queue}")
             response_message = create_message('GET_RESULT', response)
@@ -405,7 +476,8 @@ class Keeper:
                 'found': False,
                 'datasets': [],
                 'count': 0,
-                'error': str(e)
+                'error': str(e),
+                'keeper_id': self.keeper_id  # 添加keeper_id到错误响应中
             }
             self.channel.basic_publish(
                 exchange='',
@@ -436,22 +508,62 @@ class Keeper:
             return None
 
     def send_request_to_replica(self, date):
-        replica_queue = f'replica_{self.keeper_id}'
-        request_message = {'type': 'GET', 'date': date}
-        self.log(f"Sending request to replica queue {replica_queue}: {request_message}")
-        self.channel.basic_publish(exchange='', routing_key=replica_queue, body=json.dumps(request_message))
-        response = self.wait_for_response(replica_queue)
-        if response:
-            self.log(f"Received response from replica: {response}")
-        else:
-            self.log("Did not receive response from replica")
-        return response
-
-    def wait_for_response(self, queue_name):
-        method_frame, header_frame, body = self.channel.basic_get(queue=queue_name)
-        if method_frame:
-            return json.loads(body)
-        return None
+        try:
+            replica_queue = f'replica_{self.keeper_id}'
+            
+            # 创建临时队列接收响应
+            result = self.channel.queue_declare(queue='', exclusive=True)
+            callback_queue = result.method.queue
+            
+            # 生成唯一的correlation_id
+            correlation_id = str(uuid.uuid4())
+            
+            # 创建请求消息
+            request_message = create_message('GET', {'date': date})
+            
+            self.log(f"Sending request to replica queue {replica_queue} with reply_to {callback_queue}")
+            
+            # 发送请求，指定reply_to队列
+            self.channel.basic_publish(
+                exchange='', 
+                routing_key=replica_queue, 
+                properties=pika.BasicProperties(
+                    reply_to=callback_queue,
+                    correlation_id=correlation_id
+                ),
+                body=request_message
+            )
+            
+            # 等待响应
+            response = None
+            start_time = time.time()
+            timeout = 2  # 2秒超时
+            
+            while time.time() - start_time < timeout:
+                method_frame, header_frame, body = self.channel.basic_get(queue=callback_queue)
+                if method_frame:
+                    if header_frame.correlation_id == correlation_id:
+                        response = json.loads(body)
+                        self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                        break
+                    else:
+                        # 如果correlation_id不匹配，重新放回队列
+                        self.channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=True)
+                time.sleep(0.1)
+            
+            # 删除临时队列
+            self.channel.queue_delete(queue=callback_queue)
+            
+            if response:
+                self.log(f"Received response from replica: {response}")
+            else:
+                self.log("Did not receive response from replica within timeout")
+                
+            return response
+        except Exception as e:
+            self.log(f"Error in send_request_to_replica: {e}", True)
+            traceback.print_exc()
+            return None
 
     def run(self):
         self.log(f"Storage device {self.keeper_id} running...")

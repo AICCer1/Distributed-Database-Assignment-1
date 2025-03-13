@@ -103,6 +103,19 @@ class Manager:
         try:
             print(f"Loading file: {filename}")
             
+            # 首先检查是否有可用的keeper节点
+            available_keepers = [i for i in range(self.num_keepers) 
+                               if self.keepers[i] is not None and 
+                               (i not in self.keeper_status or self.keeper_status[i])]
+            
+            if not available_keepers:
+                print("No available keeper nodes in the system!")
+                self.send_to_client(create_message('LOAD_RESULT', {
+                    'success': False, 
+                    'error': "No available storage nodes in the system. All nodes have failed. Cannot load data."
+                }))
+                return
+            
             file_found = False
             for root, dirs, files in os.walk(os.getcwd()):
                 if filename in files:
@@ -521,6 +534,13 @@ class Manager:
                 response_type = response_message.get('type')
                 response_content = response_message.get('data', {})
                 
+                # 检查是否是"数据不存在"的响应
+                if response_type == 'GET_RESULT' and not response_content.get('found', False):
+                    print(f"Keeper {available_keeper_id} reported that data for date {date_str} does not exist")
+                    # 这是正常的"数据不存在"响应，不需要将keeper标记为不可用
+                    self.send_to_client(create_message(response_type, response_content))
+                    return
+                
                 if response_type == 'GET_RESULT' and response_content.get('found'):
                     if 'datasets' in response_content:
                         print(f"DEBUG - Received response with datasets structure")
@@ -553,28 +573,101 @@ class Manager:
             else:
                 print(f"No response received, sending empty response to client")
                 
-                # 如果请求超时，将这个keeper标记为不可用，并从数据索引中移除
-                if standard_date in self.data_index:
-                    if isinstance(self.data_index[standard_date], list) and available_keeper_id in self.data_index[standard_date]:
-                        self.data_index[standard_date].remove(available_keeper_id)
-                        print(f"Removed unresponsive keeper {available_keeper_id} from data index for date {standard_date}")
-                    elif self.data_index[standard_date] == available_keeper_id:
-                        # 如果这是唯一的keeper，使用哈希环找到新的keeper
-                        new_keeper_queue = self.hash_ring.get_node(standard_date)
-                        if new_keeper_queue:
-                            new_keeper_id = int(new_keeper_queue.split('_')[1])
-                            if new_keeper_id != available_keeper_id:
-                                self.data_index[standard_date] = new_keeper_id
-                                print(f"Replaced unresponsive keeper {available_keeper_id} with {new_keeper_id} in data index")
+                # 检查是否是因为节点故障还是仅仅是没有数据
+                # 使用健康检查来确认节点是否真的不可用
+                is_keeper_down = False
+                try:
+                    # 使用单独的连接进行健康检查
+                    health_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+                    health_channel = health_connection.channel()
+                    
+                    # 创建临时队列
+                    result = health_channel.queue_declare(queue='', exclusive=True)
+                    health_queue = result.method.queue
+                    
+                    # 设置响应变量
+                    health_response = False
+                    corr_id = str(uuid.uuid4())
+                    
+                    def on_health_response(ch, method, props, body):
+                        nonlocal health_response
+                        if props.correlation_id == corr_id:
+                            health_response = True
+                            ch.basic_ack(delivery_tag=method.delivery_tag)
+                    
+                    health_channel.basic_consume(
+                        queue=health_queue,
+                        on_message_callback=on_health_response,
+                        auto_ack=False
+                    )
+                    
+                    # 发送健康检查请求
+                    health_channel.basic_publish(
+                        exchange='',
+                        routing_key=f'keeper_{available_keeper_id}',
+                        properties=pika.BasicProperties(
+                            reply_to=health_queue,
+                            correlation_id=corr_id,
+                        ),
+                        body=create_message('HEALTH_CHECK', {})
+                    )
+                    
+                    # 等待响应，设置短超时
+                    start_time = time.time()
+                    while not health_response and time.time() - start_time < 2:  # 2秒超时
+                        try:
+                            health_connection.process_data_events(time_limit=0.1)
+                        except Exception as e:
+                            print(f"Error during health check: {e}")
+                            break
+                    
+                    # 清理资源
+                    try:
+                        health_channel.queue_delete(queue=health_queue)
+                        health_connection.close()
+                    except Exception as e:
+                        print(f"Error cleaning up health check resources: {e}")
+                    
+                    # 如果没有收到健康检查响应，则认为节点不可用
+                    if not health_response:
+                        print(f"Keeper {available_keeper_id} failed health check, marking as unavailable")
+                        is_keeper_down = True
+                    else:
+                        print(f"Keeper {available_keeper_id} is healthy, just no data for date {date_str}")
+                        
+                except Exception as e:
+                    print(f"Error performing health check: {e}")
+                    # 如果健康检查过程中出错，不要立即标记节点为不可用
                 
-                # 标记这个keeper为不可用
-                self.keeper_status[available_keeper_id] = False
+                # 只有在确认节点不可用的情况下才更新数据索引和节点状态
+                if is_keeper_down:
+                    if standard_date in self.data_index:
+                        if isinstance(self.data_index[standard_date], list) and available_keeper_id in self.data_index[standard_date]:
+                            self.data_index[standard_date].remove(available_keeper_id)
+                            print(f"Removed unresponsive keeper {available_keeper_id} from data index for date {standard_date}")
+                        elif self.data_index[standard_date] == available_keeper_id:
+                            # 如果这是唯一的keeper，使用哈希环找到新的keeper
+                            new_keeper_queue = self.hash_ring.get_node(standard_date)
+                            if new_keeper_queue:
+                                new_keeper_id = int(new_keeper_queue.split('_')[1])
+                                if new_keeper_id != available_keeper_id:
+                                    self.data_index[standard_date] = new_keeper_id
+                                    print(f"Replaced unresponsive keeper {available_keeper_id} with {new_keeper_id} in data index")
+                    
+                    # 检查是否是系统刚启动，没有数据的情况
+                    if len(self.data_index) == 0 or (len(self.data_index) == 1 and standard_date in self.data_index):
+                        print(f"System just started, no data loaded yet. Not marking keeper {available_keeper_id} as unavailable.")
+                    else:
+                        # 标记这个keeper为不可用
+                        self.keeper_status[available_keeper_id] = False
+                        print(f"Marked keeper {available_keeper_id} as unavailable")
                 
                 empty_response = {
                     'date': date_str,
                     'found': False,
                     'datasets': [],
-                    'count': 0
+                    'count': 0,
+                    'error': "No data found for this date" if not is_keeper_down else "Storage node is not responding"
                 }
                 self.send_to_client(create_message('GET_RESULT', empty_response))
             
@@ -619,9 +712,12 @@ class Manager:
                                    (i not in self.keeper_status or self.keeper_status[i])]
                 
                 if not available_keepers:
-                    print("\n*** WARNING: No available keeper nodes in the system! ***")
+                    print("\n" + "="*80)
+                    print("*** CRITICAL WARNING: No available keeper nodes in the system! ***")
                     print("*** The system cannot serve requests in this state. ***")
-                    print("*** Please restart the system or add new keeper nodes. ***\n")
+                    print("*** Please restart the system using: python manager.py <num_keepers> ***")
+                    print("*** All data operations will fail until the system is restarted. ***")
+                    print("="*80 + "\n")
                 else:
                     print(f"System status: {len(available_keepers)}/{self.num_keepers} keeper nodes available")
         
@@ -835,8 +931,12 @@ class Manager:
                                (i not in self.keeper_status or self.keeper_status[i])]
             
             if not available_keepers:
-                print("WARNING: No available keeper nodes left in the system after failure of keeper {failed_keeper_id}!")
-                print("The system cannot recover from this state. All data is now unavailable.")
+                print("\n" + "="*80)
+                print(f"*** CRITICAL WARNING: No available keeper nodes left in the system after removing keeper {failed_keeper_id}! ***")
+                print("*** The system cannot recover from this state. All data is now unavailable. ***")
+                print("*** Please restart the system using: python manager.py <num_keepers> ***")
+                print("*** All data operations will fail until the system is restarted. ***")
+                print("="*80 + "\n")
                 # 清理处理标记
                 self.handling_failure.remove(failed_keeper_id)
                 return
@@ -985,7 +1085,12 @@ class Manager:
                            (i not in self.keeper_status or self.keeper_status[i])]
         
         if not available_keepers:
-            print("WARNING: No available keeper nodes left in the system after removing keeper {keeper_id}!")
+            print("\n" + "="*80)
+            print(f"*** CRITICAL WARNING: No available keeper nodes left in the system after removing keeper {keeper_id}! ***")
+            print("*** The system cannot recover from this state. All data is now unavailable. ***")
+            print("*** Please restart the system using: python manager.py <num_keepers> ***")
+            print("*** All data operations will fail until the system is restarted. ***")
+            print("="*80 + "\n")
             # 不尝试更新数据索引，因为没有可用的节点
             return
         
@@ -1170,13 +1275,22 @@ class Manager:
                 
                 for date, date_data in data.items():
                     try:
-                        # 发送每个日期的数据到目标keeper
+                        # 确保数据结构完整，特别是保持多个数据集的结构
+                        print(f"Migrating data for date {date}")
+                        
+                        # 检查数据结构
+                        if isinstance(date_data, dict) and 'datasets' in date_data:
+                            print(f"Date {date} has {len(date_data['datasets'])} datasets")
+                        else:
+                            print(f"Date {date} has old format data structure")
+                        
+                        # 直接发送完整的数据结构，保持原始格式
                         self.send_to_keeper(target_keeper_id, create_message('STORE', {
                             'date': date,
-                            'data': date_data.get('data', []),
-                            'column_names': date_data.get('column_names', []),
-                            'source_file': date_data.get('source_file', 'migration')
+                            'data': date_data,
+                            'source_file': 'migration'
                         }))
+                        
                         dates_migrated += 1
                         
                         if dates_migrated % 10 == 0:
@@ -1184,6 +1298,7 @@ class Manager:
                         
                     except Exception as e:
                         print(f"Error sending data for date {date}: {e}")
+                        traceback.print_exc()
                         success = False
                 
                 print(f"Data migration completed: {dates_migrated}/{len(data)} dates migrated to keeper {target_keeper_id}")

@@ -186,7 +186,9 @@ class Client(cmd.Cmd):
                         print(f"Unique dates: {dates}")
                 else:
                     error = data.get('error', 'Unknown error')
+                    print(f"\n===== Error loading file =====")
                     print(f"Failed to load file: {error}")
+                    print("===== End of error message =====\n")
             
             ch.basic_ack(delivery_tag=method.delivery_tag)
             
