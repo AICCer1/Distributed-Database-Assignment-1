@@ -64,9 +64,9 @@ class Keeper:
             data = message.get('data')
             
             # 不打印健康检查消息，减少日志输出
-            if msg_type != 'HEALTH_CHECK':
+            if msg_type != 'HEALTH_CHECK' and msg_type != 'PING':
                 self.log(f"Storage device {self.keeper_id} received message: {msg_type}, data: {data}")
-                
+            
             if msg_type == 'STORE':
                 self.handle_store(data)
                 self.send_to_replica(body)
@@ -100,6 +100,8 @@ class Keeper:
                 self.handle_get_direct(data)
             elif msg_type == 'HEALTH_CHECK':
                 self.handle_health_check(properties)
+            elif msg_type == 'PING':
+                self.handle_ping(properties)
             else:
                 self.log(f"Storage device {self.keeper_id} received unknown type message: {msg_type}", True)
         except Exception as e:
@@ -636,6 +638,30 @@ class Keeper:
                 # self.log(f"Storage device {self.keeper_id} sent health check response")
             except Exception as e:
                 self.log(f"Error sending health check response: {str(e)}", True)
+                traceback.print_exc()
+
+    def handle_ping(self, properties):
+        """Handle ping request from manager"""
+        # 如果有reply_to队列，发送响应
+        if properties and properties.reply_to:
+            try:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=json.dumps({
+                        'type': 'PONG',
+                        'data': {
+                            'keeper_id': self.keeper_id,
+                            'timestamp': time.time()
+                        }
+                    })
+                )
+                self.log(f"Sent ping response to {properties.reply_to}")
+            except Exception as e:
+                self.log(f"Error sending ping response: {str(e)}", True)
                 traceback.print_exc()
 
 if __name__ == "__main__":
