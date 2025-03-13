@@ -70,6 +70,10 @@ class Replica:
                 self.handle_replicate(data)
             elif msg_type == 'GET_ALL_DATA':
                 self.handle_get_all_data(properties)
+            elif msg_type == 'GET_DATE_LIST':
+                self.handle_get_date_list(properties)
+            elif msg_type == 'GET_DATA_BATCH':
+                self.handle_get_data_batch(data, properties)
             elif msg_type == 'TERMINATE':
                 self.handle_terminate()
             else:
@@ -417,6 +421,133 @@ class Replica:
         else:
             self.log(f"Replica: No data found for date: {date}")
             return None
+
+    def handle_get_date_list(self, properties):
+        """Handle request to get list of all dates"""
+        self.log(f"Replica {self.keeper_id} received request for date list")
+        
+        try:
+            # 获取所有日期列表
+            date_list = list(self.data.keys())
+            self.log(f"Replica has {len(date_list)} dates")
+            
+            # 准备响应
+            response = {
+                'success': True,
+                'dates': date_list
+            }
+            
+            # 发送响应
+            if properties and properties.reply_to:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=create_message('GET_DATE_LIST_RESULT', response)
+                )
+                self.log(f"Replica {self.keeper_id} sent date list ({len(date_list)} dates)")
+            else:
+                self.log(f"No reply_to queue provided for GET_DATE_LIST request", True)
+        except Exception as e:
+            self.log(f"Error handling GET_DATE_LIST request: {str(e)}", True)
+            traceback.print_exc()
+            
+            # 尝试发送错误响应
+            if properties and properties.reply_to:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=create_message('GET_DATE_LIST_RESULT', {'success': False, 'error': str(e)})
+                )
+
+    def handle_get_data_batch(self, data, properties):
+        """Handle request to get data for a batch of dates"""
+        date_list = data.get('dates', [])
+        self.log(f"Replica {self.keeper_id} received request for data batch with {len(date_list)} dates")
+        
+        try:
+            # 获取指定日期的数据
+            batch_data = {}
+            for date in date_list:
+                if date in self.data:
+                    # 确保数据是可序列化的，同时保持完整的数据结构
+                    date_data = self.data[date]
+                    
+                    if isinstance(date_data, dict):
+                        if 'datasets' in date_data:
+                            # 如果已经是新格式（包含datasets字段），直接使用
+                            batch_data[date] = date_data
+                        elif 'data' in date_data:
+                            # 如果是中间格式（包含data字段但没有datasets字段），转换为新格式
+                            batch_data[date] = {
+                                'datasets': [{
+                                    'data': date_data.get('data', []),
+                                    'column_names': date_data.get('column_names', []),
+                                    'source_file': date_data.get('source_file', 'unknown')
+                                }]
+                            }
+                        else:
+                            # 其他字典格式，尝试转换
+                            batch_data[date] = {
+                                'datasets': [{
+                                    'data': [],
+                                    'column_names': [],
+                                    'source_file': 'unknown'
+                                }]
+                            }
+                            for key, value in date_data.items():
+                                if key not in ['datasets']:
+                                    batch_data[date]['datasets'][0][key] = value
+                    else:
+                        # 如果是旧格式（列表），转换为新格式
+                        batch_data[date] = {
+                            'datasets': [{
+                                'data': date_data if isinstance(date_data, list) else [],
+                                'column_names': [],
+                                'source_file': 'unknown'
+                            }]
+                        }
+            
+            self.log(f"Prepared data for {len(batch_data)}/{len(date_list)} dates")
+            
+            # 准备响应
+            response = {
+                'success': True,
+                'data': batch_data
+            }
+            
+            # 发送响应
+            if properties and properties.reply_to:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=create_message('GET_DATA_BATCH_RESULT', response)
+                )
+                self.log(f"Replica {self.keeper_id} sent data batch ({len(batch_data)} dates)")
+            else:
+                self.log(f"No reply_to queue provided for GET_DATA_BATCH request", True)
+        except Exception as e:
+            self.log(f"Error handling GET_DATA_BATCH request: {str(e)}", True)
+            traceback.print_exc()
+            
+            # 尝试发送错误响应
+            if properties and properties.reply_to:
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=create_message('GET_DATA_BATCH_RESULT', {'success': False, 'error': str(e)})
+                )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Start a replica node')
