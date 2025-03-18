@@ -56,22 +56,42 @@ class Client(cmd.Cmd):
                     date = data.get('date', '')
                     count = data.get('count', 0)
                     keeper_id = data.get('keeper_id', 'unknown')
+                    keepers_queried = data.get('keepers_queried', [])
                     
                     # 显示数据来自哪个keeper节点
-                    print(f"Data from keeper node: {keeper_id}")
+                    if 'keepers_queried' in data:
+                        print(f"Data queried from keeper nodes: {keepers_queried}")
+                    else:
+                        print(f"Data from keeper node: {keeper_id}")
                     
                     # 检查是否使用新的数据结构（包含datasets字段）
                     if 'datasets' in data:
                         datasets = data.get('datasets', [])
                         print(f"Found {count} records in {len(datasets)} datasets for the date: {date}\n")
                         
+                        # 数据源摘要
+                        sources = {}
+                        for ds in datasets:
+                            source = ds.get('source_file', 'unknown')
+                            records = len(ds.get('data', []))
+                            if source in sources:
+                                sources[source] += records
+                            else:
+                                sources[source] = records
+                        
+                        print("Data sources summary:")
+                        for source, count in sources.items():
+                            print(f"  - {source}: {count} records")
+                        print()
+                        
                         # 遍历每个数据集
                         for dataset_idx, dataset in enumerate(datasets):
                             records = dataset.get('data', [])
                             column_names = dataset.get('column_names', [])
                             source_file = dataset.get('source_file', 'unknown')
+                            ds_keeper_id = dataset.get('keeper_id', keeper_id)
                             
-                            print(f"\n----- Dataset #{dataset_idx + 1} from {source_file} -----")
+                            print(f"\n----- Dataset #{dataset_idx + 1} from {source_file} (keeper {ds_keeper_id}) -----")
                             print(f"Records count: {len(records)}")
                             
                             if column_names and len(column_names) > 0:
@@ -82,8 +102,11 @@ class Client(cmd.Cmd):
                                     print(", ".join(chunk))
                                 print("-" * 100)
                             
-                            # 显示所有记录，不省略
-                            for record_idx, record in enumerate(records):
+                            # 对于大数据集，限制显示的记录数
+                            max_records_to_show = 10
+                            records_to_display = records[:max_records_to_show] if len(records) > max_records_to_show else records
+                            
+                            for record_idx, record in enumerate(records_to_display):
                                 print(f"\nRecord #{record_idx + 1}:")
                                 print("-" * 50)
                                 
@@ -110,6 +133,10 @@ class Client(cmd.Cmd):
                                 else:
                                     print(record)
                                 print("-" * 50)
+                            
+                            # 显示记录被截断的提示
+                            if len(records) > max_records_to_show:
+                                print(f"\n... and {len(records) - max_records_to_show} more records (showing first {max_records_to_show} only)")
                             
                             print(f"----- End of Dataset #{dataset_idx + 1} -----\n")
                     else:

@@ -396,10 +396,16 @@ class Manager:
             
             # 创建一个已尝试过的keeper列表，避免重复尝试
             tried_keepers = []
+            # 创建一个列表存储所有找到的数据集
+            all_datasets = []
+            # 记录所有查询过的keeper节点
+            keepers_queried = []
+            # 记录是否找到了数据
+            data_found = False
             
             # 尝试查询数据的函数
             def try_get_data_from_keeper(keeper_id):
-                nonlocal tried_keepers
+                nonlocal tried_keepers, all_datasets, data_found, keepers_queried
                 
                 if keeper_id in tried_keepers:
                     print(f"Already tried keeper {keeper_id}, skipping")
@@ -497,10 +503,16 @@ class Manager:
                             return False  # 表示节点正常，但没有数据
                         
                         if response_type == 'GET_RESULT' and response_content.get('found'):
+                            keepers_queried.append(keeper_id)
+                            data_found = True
+                            
                             if 'datasets' in response_content:
                                 print(f"DEBUG - Received response with datasets structure")
-                                # 添加keeper_id信息
-                                response_content['keeper_id'] = keeper_id
+                                # 添加keeper_id信息到每个数据集
+                                for dataset in response_content['datasets']:
+                                    dataset['keeper_id'] = keeper_id
+                                # 添加数据集到结果集合
+                                all_datasets.extend(response_content['datasets'])
                             else:
                                 data = response_content.get('data', [])
                                 column_names = response_content.get('column_names', [])
@@ -511,18 +523,14 @@ class Manager:
                                         flat_data.extend(group)
                                     data = flat_data
                                 
-                                response_content['datasets'] = [{
+                                # 创建新的数据集并添加到结果集合
+                                new_dataset = {
                                     'data': data,
                                     'column_names': column_names,
-                                    'source_file': 'unknown'
-                                }]
-                                if 'data' in response_content:
-                                    del response_content['data']
-                                if 'column_names' in response_content:
-                                    del response_content['column_names']
-                                
-                                # 添加keeper_id信息
-                                response_content['keeper_id'] = keeper_id
+                                    'source_file': response_content.get('source_file', 'unknown'),
+                                    'keeper_id': keeper_id
+                                }
+                                all_datasets.append(new_dataset)
                             
                             # 更新数据索引
                             if standard_date in self.data_index:
@@ -536,8 +544,7 @@ class Manager:
                             
                             print(f"Updated data index for date {standard_date}: {self.data_index[standard_date]}")
                             
-                            # 返回找到的数据
-                            return response_content
+                            return True  # 表示找到了数据
                     else:
                         print(f"No response received from keeper {keeper_id}")
                         
@@ -579,60 +586,67 @@ class Manager:
             if keeper_ids:
                 for keeper_id in keeper_ids:
                     if isinstance(keeper_id, int) and (keeper_id not in self.keeper_status or self.keeper_status[keeper_id]):
-                        result = try_get_data_from_keeper(keeper_id)
-                        if result:  # 找到数据
-                            self.send_to_client(create_message('GET_RESULT', result))
-                            return
+                        try_get_data_from_keeper(keeper_id)
                     elif isinstance(keeper_id, str) and keeper_id.startswith('keeper_'):
                         k_id = int(keeper_id.split('_')[1])
                         if k_id not in self.keeper_status or self.keeper_status[k_id]:
-                            result = try_get_data_from_keeper(k_id)
-                            if result:  # 找到数据
-                                self.send_to_client(create_message('GET_RESULT', result))
-                                return
+                            try_get_data_from_keeper(k_id)
             
             # 如果索引中的keeper都没有数据，使用哈希环找到其他可能的keeper
-            print(f"No data found in indexed keepers for date {date_str}, trying other keepers using hash ring")
-            
-            # 获取所有可用的keeper节点
-            available_keepers = [i for i in range(self.num_keepers) 
-                               if i not in tried_keepers and 
-                               self.keepers[i] is not None and 
-                               (i not in self.keeper_status or self.keeper_status[i])]
-            
-            # 使用哈希环找到可能的keeper
-            for i in range(min(3, len(available_keepers))):  # 最多尝试3个其他keeper
-                keeper_queue = self.hash_ring.get_node(standard_date)
-                if keeper_queue:
-                    keeper_id = int(keeper_queue.split('_')[1])
-                    if keeper_id in available_keepers and keeper_id not in tried_keepers:
-                        print(f"Trying keeper {keeper_id} from hash ring")
-                        result = try_get_data_from_keeper(keeper_id)
-                        if result:  # 找到数据
-                            self.send_to_client(create_message('GET_RESULT', result))
-                            return
+            if not data_found:
+                print(f"No data found in indexed keepers for date {date_str}, trying other keepers using hash ring")
                 
-                # 如果没有找到数据，尝试下一个可能的keeper
-                if available_keepers:
-                    next_keeper = available_keepers[0]
-                    available_keepers.remove(next_keeper)
-                    if next_keeper not in tried_keepers:
-                        print(f"Trying next available keeper {next_keeper}")
-                        result = try_get_data_from_keeper(next_keeper)
-                        if result:  # 找到数据
-                            self.send_to_client(create_message('GET_RESULT', result))
-                            return
+                # 获取所有可用的keeper节点
+                available_keepers = [i for i in range(self.num_keepers) 
+                                   if i not in tried_keepers and 
+                                   self.keepers[i] is not None and 
+                                   (i not in self.keeper_status or self.keeper_status[i])]
+                
+                # 使用哈希环找到可能的keeper
+                for i in range(min(3, len(available_keepers))):  # 最多尝试3个其他keeper
+                    keeper_queue = self.hash_ring.get_node(standard_date)
+                    if keeper_queue:
+                        keeper_id = int(keeper_queue.split('_')[1])
+                        if keeper_id in available_keepers and keeper_id not in tried_keepers:
+                            print(f"Trying keeper {keeper_id} from hash ring")
+                            try_get_data_from_keeper(keeper_id)
+                    
+                    # 如果没有找到数据，尝试下一个可能的keeper
+                    if available_keepers and not data_found:
+                        next_keeper = available_keepers[0]
+                        available_keepers.remove(next_keeper)
+                        if next_keeper not in tried_keepers:
+                            print(f"Trying next available keeper {next_keeper}")
+                            try_get_data_from_keeper(next_keeper)
             
-            # 如果所有尝试都失败，返回空响应
-            print(f"No data found for date {date_str} in any keeper")
-            empty_response = {
-                'date': date_str,
-                'found': False,
-                'datasets': [],
-                'count': 0,
-                'error': "No data found for this date"
-            }
-            self.send_to_client(create_message('GET_RESULT', empty_response))
+            # 处理结果
+            if data_found and all_datasets:
+                # 计算总记录数
+                total_records = sum(len(dataset.get('data', [])) for dataset in all_datasets)
+                
+                # 构建完整响应
+                complete_response = {
+                    'date': date_str,
+                    'found': True,
+                    'datasets': all_datasets,
+                    'count': total_records,
+                    'keepers_queried': keepers_queried  # 添加查询过的keeper节点列表
+                }
+                
+                # 发送合并后的结果给客户端
+                self.send_to_client(create_message('GET_RESULT', complete_response))
+                return
+            else:
+                # 如果所有尝试都失败，返回空响应
+                print(f"No data found for date {date_str} in any keeper")
+                empty_response = {
+                    'date': date_str,
+                    'found': False,
+                    'datasets': [],
+                    'count': 0,
+                    'error': "No data found for this date"
+                }
+                self.send_to_client(create_message('GET_RESULT', empty_response))
             
         except Exception as e:
             print(f"Error processing GET command: {e}")
