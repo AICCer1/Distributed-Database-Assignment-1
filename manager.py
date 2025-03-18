@@ -1263,7 +1263,7 @@ class Manager:
         print(f"Retrieved {len(date_list)} dates from replica of keeper {source_keeper_id}")
         
         # 分批获取和迁移数据
-        batch_size = 50  # 每批处理的日期数
+        batch_size = 200  # 每批处理的日期数
         total_dates = len(date_list)
         dates_migrated = 0
         success = True
