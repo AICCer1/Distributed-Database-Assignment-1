@@ -30,6 +30,7 @@ class Manager:
         self.verbose = verbose  # 是否启用详细日志输出
         self.datamart = None    # DataMart process for temperature data analysis
         self.date_file_cache = {}  # 缓存日期-文件对应关系，避免频繁查询
+        self.replica_date_cache = {}  # 缓存replica的日期列表，避免重复获取
 
         self.init_rabbitmq()
         
@@ -314,10 +315,10 @@ class Manager:
                             
                         # 发送批次数据
                         print(f"Sending batch of {len(batch_dates)} dates to keeper {keeper_id}")
-                        self.send_to_keeper(keeper_id, create_message('STORE_BATCH', {
+                        self.send_to_keeper_safe(keeper_id, create_message('STORE_BATCH', {
                             'batch_data': batch_data,
                             'source_file': filename
-                        }))
+                        }), is_migration=False)  # 加载数据不视为迁移数据
                             
                         # 每处理一批发送一次进度通知
                         progress_percent = (dates_processed / (total_dates - len(skipped_dates))) * 100
@@ -602,11 +603,16 @@ class Manager:
                                 if source_file != 'unknown':
                                     self.update_date_file_cache(standard_date, source_file)
                                 
-                                if data and isinstance(data[0], list) and isinstance(data[0][0], list):
-                                    flat_data = []
-                                    for group in data:
-                                        flat_data.extend(group)
-                                    data = flat_data
+                                # 安全检查数据结构以避免KeyError
+                                if data and isinstance(data, list) and len(data) > 0:
+                                    # 检查是否是嵌套列表结构
+                                    if isinstance(data[0], list):
+                                        # 再次检查是否是二层嵌套
+                                        if len(data[0]) > 0 and isinstance(data[0][0], list):
+                                            flat_data = []
+                                            for group in data:
+                                                flat_data.extend(group)
+                                            data = flat_data
                                 
                                 # 创建新的数据集并添加到结果集合
                                 new_dataset = {
@@ -845,6 +851,43 @@ class Manager:
             traceback.print_exc()
             return False
 
+    def send_to_keeper_safe(self, keeper_id, message, is_migration=False):
+        """发送消息到keeper的安全版本，适用于大批量数据迁移
+        当is_migration=True时使用独立连接，避免主连接崩溃"""
+        if not is_migration:
+            # 使用主连接发送
+            return self.send_to_keeper(keeper_id, message)
+            
+        # 使用独立连接发送迁移数据
+        temp_connection = None
+        try:
+            # 创建新的临时连接
+            temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
+                'localhost',
+                heartbeat=30,
+                blocked_connection_timeout=60
+            ))
+            temp_channel = temp_connection.channel()
+            
+            # 使用临时连接发送消息
+            temp_channel.basic_publish(
+                exchange='',
+                routing_key=f'keeper_{keeper_id}',
+                body=message
+            )
+            
+            # 关闭临时连接
+            temp_connection.close()
+            return True
+        except Exception as e:
+            print(f"Error sending migration data to keeper {keeper_id}: {e}")
+            if temp_connection and temp_connection.is_open:
+                try:
+                    temp_connection.close()
+                except:
+                    pass
+            return False
+
     def send_to_keeper(self, keeper_id, message):
         self.channel.basic_publish(
             exchange='',
@@ -886,14 +929,55 @@ class Manager:
         status_thread.daemon = True
         status_thread.start()
         
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            print("Manager is shutting down...")
-            for keeper in self.keepers:
-                if keeper:
+        running = True
+        connection_errors = 0
+        max_connection_errors = 5
+        
+        while running and connection_errors < max_connection_errors:
+            try:
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                print("Manager is shutting down...")
+                running = False
+            except (pika.exceptions.ConnectionClosedByBroker, 
+                   pika.exceptions.AMQPConnectionError,
+                   pika.exceptions.StreamLostError) as e:
+                connection_errors += 1
+                print(f"Connection error ({connection_errors}/{max_connection_errors}): {str(e)}")
+                
+                # 尝试恢复连接
+                recovery_success = self.handle_connection_error(str(e))
+                
+                # 如果恢复失败并达到最大错误次数，终止程序
+                if not recovery_success and connection_errors >= max_connection_errors:
+                    print("Too many connection errors, shutting down...")
+                    running = False
+                
+                # 成功恢复后给一点时间让系统稳定
+                if recovery_success:
+                    time.sleep(2)
+                    connection_errors = 0  # 重置错误计数
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                traceback.print_exc()
+                connection_errors += 1
+                time.sleep(1)  # 添加短暂延迟避免快速失败循环
+        
+        # 清理资源
+        for keeper in self.keepers:
+            if keeper:
+                try:
                     keeper.terminate()
-            self.connection.close()
+                except:
+                    pass
+                    
+        if self.connection and self.connection.is_open:
+            try:
+                self.connection.close()
+            except:
+                pass
+                
+        print("Manager has shutdown")
 
     def process_query(self, query):
         if query.startswith("LOAD"):
@@ -1079,233 +1163,144 @@ class Manager:
                     print(f"Keeper {failed_keeper_id} failure is already being handled")
                     return
                 
-            # 标记正在处理此keeper的故障
-            if not hasattr(self, 'handling_failure'):
-                self.handling_failure = set()
-            self.handling_failure.add(failed_keeper_id)
+                # 标记正在处理
+                if not hasattr(self, 'handling_failure'):
+                    self.handling_failure = []
+                self.handling_failure.append(failed_keeper_id)
                 
-            # 标记keeper为故障状态
-            self.keeper_status[failed_keeper_id] = False
-            
-            # 检查是否还有可用的keeper节点
-            available_keepers = [i for i in range(self.num_keepers) 
-                               if i != failed_keeper_id and 
-                               self.keepers[i] is not None and 
-                               (i not in self.keeper_status or self.keeper_status[i])]
-            
-            if not available_keepers:
-                print("\n" + "="*80)
-                print(f"*** CRITICAL WARNING: No available keeper nodes left in the system after removing keeper {failed_keeper_id}! ***")
-                print("*** The system cannot recover from this state. All data is now unavailable. ***")
-                print("*** Please restart the system using: python manager.py <num_keepers> ***")
-                print("*** All data operations will fail until the system is restarted. ***")
-                print("="*80 + "\n")
-                # 清理处理标记
-                self.handling_failure.remove(failed_keeper_id)
-                return
-            
-            # 确保replica队列存在
-            replica_exists = False
-            try:
-                temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
-                    host='localhost',
-                    connection_attempts=3,
-                    retry_delay=1,
-                    socket_timeout=5
-                ))
-                temp_channel = temp_connection.channel()
-                
-                # 检查replica队列是否存在
-                replica_queue = f'replica_{failed_keeper_id}'
-                try:
-                    temp_channel.queue_declare(queue=replica_queue, passive=True)
-                    print(f"Replica queue {replica_queue} exists")
-                    replica_exists = True
-                except pika.exceptions.ChannelClosedByBroker:
-                    print(f"Replica queue {replica_queue} does not exist")
-                    replica_exists = False
-                
-                temp_connection.close()
-                
-                if not replica_exists:
-                    print(f"No replica available for keeper {failed_keeper_id}, cannot migrate data")
-                    # 即使没有replica，也要从数据索引中移除失败的keeper
-                    self.remove_from_data_index(failed_keeper_id)
-                    self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                    print(f"Removed keeper {failed_keeper_id} from the hash ring")
-                    
-                    # 终止keeper进程
-                    if self.keepers[failed_keeper_id]:
-                        try:
-                            self.keepers[failed_keeper_id].terminate()
-                            self.keepers[failed_keeper_id] = None
-                            print(f"Terminated keeper {failed_keeper_id} process")
-                        except Exception as e:
-                            print(f"Error terminating keeper {failed_keeper_id} process: {e}")
-                            traceback.print_exc()
-                    
-                    self.handling_failure.remove(failed_keeper_id)
-                    return
-                    
-            except Exception as e:
-                print(f"Error checking replica queue: {e}")
-                traceback.print_exc()
-                
-                # 如果无法检查replica队列，假设它不存在
-                replica_exists = False
-                
-                # 从数据索引中移除失败的keeper
-                self.remove_from_data_index(failed_keeper_id)
+                # 更新环上的节点移除故障节点
                 self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                print(f"Removed keeper {failed_keeper_id} from the hash ring due to error checking replica")
+                self.keeper_status[failed_keeper_id] = False
+                self.keepers[failed_keeper_id] = None
                 
-                # 终止keeper进程
-                if self.keepers[failed_keeper_id]:
-                    try:
-                        self.keepers[failed_keeper_id].terminate()
-                        self.keepers[failed_keeper_id] = None
-                        print(f"Terminated keeper {failed_keeper_id} process")
-                    except Exception as e:
-                        print(f"Error terminating keeper {failed_keeper_id} process: {e}")
-                        traceback.print_exc()
+                # 尝试确定哪些日期需要迁移
+                needs_migration = True
+                affected_dates = []
                 
-                self.handling_failure.remove(failed_keeper_id)
-                return
-            
-            # 如果replica存在，找到下一个keeper来接管数据
-            
-            # Find the next keeper in the hash ring to take over
-            keeper_nodes = [f'keeper_{i}' for i in range(self.num_keepers) 
-                           if i != failed_keeper_id and 
-                           (i not in self.keeper_status or self.keeper_status[i])]
-            
-            if not keeper_nodes:
-                print("No available keepers to handle redistribution!")
-                # 即使没有可用的keeper，也要从数据索引中移除失败的keeper
-                self.remove_from_data_index(failed_keeper_id)
-                self.handling_failure.remove(failed_keeper_id)
-                return
+                # 1. 从数据索引中查找
+                for date, keeper_list in self.data_index.items():
+                    if failed_keeper_id in keeper_list:
+                        affected_dates.append(date)
                 
-            # Get the next keeper in the ring (closest clockwise)
-            failed_keeper_hash = self.hash_ring._hash(f'keeper_{failed_keeper_id}')
-            next_keeper_id = None
-            min_distance = float('inf')
-            
-            for node in keeper_nodes:
-                try:
-                    node_hash = self.hash_ring._hash(node)
-                    # Calculate clockwise distance
-                    distance = (node_hash - failed_keeper_hash) % (2**128)
-                    if distance < min_distance:
-                        min_distance = distance
-                        next_keeper_id = int(node.split('_')[1])
-                except Exception as e:
-                    print(f"Error calculating distance for node {node}: {e}")
-                    traceback.print_exc()
-                    continue
-            
-            if next_keeper_id is None:
-                print("Could not determine next keeper in the hash ring")
-                # 即使找不到下一个keeper，也要从数据索引中移除失败的keeper
-                self.remove_from_data_index(failed_keeper_id)
-                self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                print(f"Removed keeper {failed_keeper_id} from the hash ring")
-                self.handling_failure.remove(failed_keeper_id)
-                return
-                
-            print(f"Selected keeper {next_keeper_id} to take over data from failed keeper {failed_keeper_id}")
-            
-            # 检查选择的keeper是否可用
-            if next_keeper_id in self.keeper_status and not self.keeper_status[next_keeper_id]:
-                print(f"Selected keeper {next_keeper_id} is also not available, trying another one")
-                # 移除这个不可用的keeper，重新尝试
-                keeper_nodes.remove(f'keeper_{next_keeper_id}')
-                if not keeper_nodes:
-                    print("No available keepers left to handle redistribution!")
-                    # 即使没有可用的keeper，也要从数据索引中移除失败的keeper
-                    self.remove_from_data_index(failed_keeper_id)
-                    self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                    print(f"Removed keeper {failed_keeper_id} from the hash ring")
-                    self.handling_failure.remove(failed_keeper_id)
-                    return
+                if not affected_dates:
+                    print(f"No dates found in data index for failed keeper {failed_keeper_id}")
                     
-                # 重新选择下一个keeper
-                next_keeper_id = None
-                min_distance = float('inf')
-                
-                for node in keeper_nodes:
-                    try:
-                        node_hash = self.hash_ring._hash(node)
-                        distance = (node_hash - failed_keeper_hash) % (2**128)
-                        if distance < min_distance:
-                            min_distance = distance
-                            next_keeper_id = int(node.split('_')[1])
-                    except Exception as e:
-                        print(f"Error calculating distance for node {node}: {e}")
-                        traceback.print_exc()
-                        continue
-                
-                if next_keeper_id is None:
-                    print("Could not determine next keeper in the hash ring after retry")
-                    # 即使找不到下一个keeper，也要从数据索引中移除失败的keeper
-                    self.remove_from_data_index(failed_keeper_id)
-                    self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                    print(f"Removed keeper {failed_keeper_id} from the hash ring")
-                    self.handling_failure.remove(failed_keeper_id)
-                    return
+                    # 2. 如果数据索引没有记录，尝试从副本获取数据
+                    print(f"Attempting to get date list from replica of keeper {failed_keeper_id}")
+                    affected_dates = self.get_date_list_from_replica(failed_keeper_id)
                     
-                print(f"Re-selected keeper {next_keeper_id} to take over data from failed keeper {failed_keeper_id}")
-            
-            # 检查目标keeper是否健康
-            if not self.check_keeper_health(next_keeper_id):
-                print(f"Target keeper {next_keeper_id} is not healthy, cannot migrate data")
-                # 从数据索引中移除失败的keeper
-                self.remove_from_data_index(failed_keeper_id)
-                self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-                print(f"Removed keeper {failed_keeper_id} from the hash ring")
+                    if not affected_dates:
+                        print(f"No data found in replica of keeper {failed_keeper_id}")
+                        needs_migration = False
+                
+                if needs_migration:
+                    print(f"Found {len(affected_dates)} dates that need to be migrated from keeper {failed_keeper_id}")
+                    
+                    # 决定目标keeper - 优先考虑有空间的节点
+                    available_keepers = []
+                    for i in range(self.num_keepers):
+                        if i != failed_keeper_id and self.keepers[i] is not None and (i not in self.keeper_status or self.keeper_status[i]):
+                            available_keepers.append(i)
+                    
+                    if not available_keepers:
+                        print("No available keepers to migrate data to")
+                        # 清理标记
+                        self.handling_failure.remove(failed_keeper_id)
+                        return
+                    
+                    # 均匀分配日期数据到其他可用的keeper
+                    target_keepers = []
+                    for date in affected_dates:
+                        # 根据当前哈希环重新计算日期应该存储在哪个keeper上
+                        key = self.get_key_for_date(date)
+                        new_keeper_id = self.get_keeper_id_for_key(key)
+                        
+                        # 确保目标keeper可用
+                        if new_keeper_id not in available_keepers:
+                            # 如果计算出的keeper不可用，选择下一个可用的
+                            new_keeper_id = available_keepers[0]
+                        
+                        target_keepers.append(new_keeper_id)
+                    
+                    # 按照目标keeper分组
+                    migration_groups = {}
+                    for i, date in enumerate(affected_dates):
+                        target_id = target_keepers[i]
+                        if target_id not in migration_groups:
+                            migration_groups[target_id] = []
+                        migration_groups[target_id].append(date)
+                    
+                    # 处理每个迁移组
+                    migration_success = True
+                    for target_id, dates in migration_groups.items():
+                        print(f"Migrating {len(dates)} dates from keeper {failed_keeper_id} to keeper {target_id}")
+                        
+                        # 分批迁移数据，每批最多50个日期
+                        batch_size = 200
+                        for i in range(0, len(dates), batch_size):
+                            batch = dates[i:i+batch_size]
+                            print(f"Processing migration batch {i//batch_size + 1}/{(len(dates)+batch_size-1)//batch_size}")
+                            
+                            # 获取这批日期的数据
+                            batch_data = self.get_data_batch_from_replica(failed_keeper_id, batch)
+                            if not batch_data:
+                                print(f"Failed to get data for batch {i//batch_size + 1}")
+                                migration_success = False
+                                continue
+                            
+                            # 发送数据到目标keeper
+                            migrated_count = 0
+                            for date, date_data in batch_data.items():
+                                try:
+                                    # 标记为迁移数据
+                                    success = self.send_to_keeper_safe(target_id, create_message('STORE', {
+                                        'date': date,
+                                        'data': date_data,
+                                        'source_file': 'migration'
+                                    }), is_migration=True)
+                                    
+                                    if success:
+                                        # 更新数据索引
+                                        if date in self.data_index:
+                                            if failed_keeper_id in self.data_index[date]:
+                                                self.data_index[date].remove(failed_keeper_id)
+                                            if target_id not in self.data_index[date]:
+                                                self.data_index[date].append(target_id)
+                                        
+                                        migrated_count += 1
+                                        if migrated_count % 10 == 0:
+                                            print(f"Migrated {migrated_count}/{len(batch_data)} dates in current batch")
+                                    else:
+                                        print(f"Failed to send data for date {date}, will try again later")
+                                        migration_success = False
+                                    
+                                    # 添加小延迟避免消息堆积
+                                    # if migrated_count % 2 == 0:  # 每2个日期添加一次延迟
+                                    #     time.sleep(0.1)  # 增加延迟时间
+                                        
+                                except Exception as e:
+                                    print(f"Error sending data for date {date}: {e}")
+                                    traceback.print_exc()
+                                    migration_success = False
+                            
+                            # 批次之间添加延迟
+                            time.sleep(0.005)
+                    
+                    # 数据迁移完成后，终止副本
+                    if migration_success:
+                        print(f"Successfully migrated data from keeper {failed_keeper_id}")
+                        self.terminate_replica(failed_keeper_id)
+                    else:
+                        print(f"Some errors occurred during migration from keeper {failed_keeper_id}")
+                
+                # 从处理列表中移除
                 self.handling_failure.remove(failed_keeper_id)
-                return
-            else:
-                print(f"Target keeper {next_keeper_id} is healthy, proceeding with migration")
+                print(f"Keeper {failed_keeper_id} failure handling completed")
             
-            # Initiate data migration from the replica of the failed keeper to the next keeper
-            print(f"Starting data migration from replica of keeper {failed_keeper_id} to keeper {next_keeper_id}")
-            migration_success = self.migrate_data_from_replica(failed_keeper_id, next_keeper_id)
-            
-            # 只有在迁移成功后才更新数据索引
-            if migration_success:
-                self.update_data_index(failed_keeper_id, next_keeper_id)
-                print(f"Migration successful, updated data index: keeper {failed_keeper_id} -> keeper {next_keeper_id}")
-            else:
-                # 如果迁移失败，只从数据索引中移除失败的keeper，而不是替换为新的keeper
-                print(f"Migration failed, removing keeper {failed_keeper_id} from data index without replacement")
-                self.remove_from_data_index(failed_keeper_id)
-            
-            # 从哈希环中移除失败的keeper
-            self.hash_ring.remove_node(f'keeper_{failed_keeper_id}')
-            print(f"Removed keeper {failed_keeper_id} from the hash ring")
-            
-            # 终止keeper进程
-            if self.keepers[failed_keeper_id]:
-                try:
-                    self.keepers[failed_keeper_id].terminate()
-                    self.keepers[failed_keeper_id] = None
-                    print(f"Terminated keeper {failed_keeper_id} process")
-                except Exception as e:
-                    print(f"Error terminating keeper {failed_keeper_id} process: {e}")
-                    traceback.print_exc()
-            
-            if migration_success:
-                print(f"Successfully handled failure of keeper {failed_keeper_id}")
-            else:
-                print(f"Failed to migrate data from keeper {failed_keeper_id}, removed from data index")
-            
-            # 标记处理完成
-            self.handling_failure.remove(failed_keeper_id)
-        
         except Exception as e:
             print(f"Error handling keeper failure: {e}")
             traceback.print_exc()
+            
             # 确保清理处理标记
             if hasattr(self, 'handling_failure') and failed_keeper_id in self.handling_failure:
                 self.handling_failure.remove(failed_keeper_id)
@@ -1344,373 +1339,326 @@ class Manager:
                 print(f"Updated data index for date {date}: {old_keeper_id} -> {new_keeper_id}")
 
     def migrate_data_from_replica(self, source_keeper_id, target_keeper_id):
-        """Migrate data from a replica to another keeper"""
-        print(f"Migrating data from replica of keeper {source_keeper_id} to keeper {target_keeper_id}")
-        
-        # 检查目标keeper是否健康
-        if not self.check_keeper_health(target_keeper_id):
-            print(f"Target keeper {target_keeper_id} is not healthy, cannot migrate data")
-            return False
-        else:
-            print(f"Target keeper {target_keeper_id} is healthy, proceeding with migration")
-        
-        # 首先获取所有日期列表
-        date_list = self.get_date_list_from_replica(source_keeper_id)
-        if date_list is None:
-            print(f"Failed to get date list from replica of keeper {source_keeper_id}")
-            return False
-        
-        if not date_list:
-            print(f"No data to migrate from replica of keeper {source_keeper_id} (empty date list)")
-            self.terminate_replica(source_keeper_id)
-            return True
-        
-        print(f"Retrieved {len(date_list)} dates from replica of keeper {source_keeper_id}")
-        
-        # 分批获取和迁移数据
-        batch_size = 200  # 每批处理的日期数
-        total_dates = len(date_list)
-        dates_migrated = 0
-        success = True
-        
-        for i in range(0, total_dates, batch_size):
-            batch_dates = date_list[i:min(i+batch_size, total_dates)]
-            print(f"Processing batch {i//batch_size + 1}/{(total_dates+batch_size-1)//batch_size}, {len(batch_dates)} dates")
+        """从replica迁移数据到新的keeper"""
+        try:
+            print(f"Starting data migration from keeper {source_keeper_id} to keeper {target_keeper_id}")
             
-            # 获取这批日期的数据
-            batch_data = self.get_data_batch_from_replica(source_keeper_id, batch_dates)
-            if batch_data is None:
-                print(f"Failed to get data for batch {i//batch_size + 1}")
-                success = False
-                continue
+            # 获取源keeper的日期列表
+            date_list = self.get_date_list_from_replica(source_keeper_id)
+            if not date_list:
+                print(f"No dates found in keeper {source_keeper_id} replica")
+                return
+                
+            print(f"Found {len(date_list)} dates in keeper {source_keeper_id} replica")
             
-            # 发送数据到目标keeper
-            for date, date_data in batch_data.items():
-                try:
-                    if dates_migrated % 10 == 0:
+            # 设置较小的批处理大小，避免消息过大
+            batch_size = 50  # 减小批处理大小
+            
+            # 计算批次数量
+            num_batches = (len(date_list) + batch_size - 1) // batch_size
+            
+            # 处理每个批次
+            migrated_count = 0
+            
+            for i in range(num_batches):
+                # 获取当前批次的日期
+                start_idx = i * batch_size
+                end_idx = min((i+1) * batch_size, len(date_list))
+                batch_dates = date_list[start_idx:end_idx]
+                
+                print(f"Processing batch {i+1}/{num_batches}, {len(batch_dates)} dates")
+                
+                # 从源replica获取数据
+                batch_data = self.get_data_batch_from_replica(source_keeper_id, batch_dates)
+                if not batch_data:
+                    print(f"Failed to get data for batch {i+1}, continuing with next batch")
+                    continue
+                
+                # 迁移每个日期的数据
+                for date, date_data in batch_data.items():
+                    try:
+                        # 将数据发送到目标keeper
                         print(f"Migrating data for date {date}")
-                    
-                    # 检查数据结构
-                    if isinstance(date_data, dict) and 'datasets' in date_data:
-                        if dates_migrated % 10 == 0:
+                        
+                        # 打印数据集数量
+                        if isinstance(date_data, dict) and 'datasets' in date_data:
                             print(f"Date {date} has {len(date_data['datasets'])} datasets")
-                    else:
-                        if dates_migrated % 10 == 0:
-                            print(f"Date {date} has old format data structure")
-                    
-                    # 直接发送完整的数据结构，保持原始格式
-                    self.send_to_keeper(target_keeper_id, create_message('STORE', {
-                        'date': date,
-                        'data': date_data,
-                        'source_file': 'migration'
-                    }))
-                    
-                    dates_migrated += 1
-                    
-                    if dates_migrated % 10 == 0:
-                        print(f"Migrated {dates_migrated}/{total_dates} dates to keeper {target_keeper_id}")
-                    
-                except Exception as e:
-                    print(f"Error sending data for date {date}: {e}")
-                    traceback.print_exc()
-                    success = False
+                        
+                        # 以"migration"作为来源标识，告诉keeper这是迁移数据
+                        success = self.send_to_keeper_safe(target_keeper_id, create_message('STORE', {
+                            'date': date,
+                            'data': date_data,  # 发送完整的数据结构
+                            'source_file': 'migration'  # 标记为迁移数据
+                        }), is_migration=True)
+                        
+                        # 如果成功发送数据，则增加计数
+                        if success:
+                            migrated_count += 1
+                            if migrated_count % 10 == 0:
+                                print(f"Migrated {migrated_count}/{len(date_list)} dates to keeper {target_keeper_id}")
+                        else:
+                            print(f"Failed to migrate data for date {date}")
+                            
+                        # 每迁移2个日期添加一个短暂延迟，避免消息堆积
+                        if migrated_count % 2 == 0:
+                            time.sleep(0.1)  # 增加延迟时间
+                        
+                    except Exception as e:
+                        print(f"Error migrating data for date {date}: {e}")
+                        traceback.print_exc()
+                
+                # 批次之间添加延迟，避免消息堆积过多
+                print(f"Completed batch {i+1}/{num_batches}, {migrated_count} dates migrated so far")
+                time.sleep(0.5)  # 批次之间添加较长延迟
             
-            # 每批处理完后等待一小段时间，避免消息队列过载
-            if i + batch_size < total_dates:
-                time.sleep(0.5)
-        
-        print(f"Data migration completed: {dates_migrated}/{total_dates} dates migrated to keeper {target_keeper_id}")
-        
-        # 终止replica
-        self.terminate_replica(source_keeper_id)
-        
-        return success and dates_migrated > 0
+            print(f"Migration complete. Migrated {migrated_count}/{len(date_list)} dates from keeper {source_keeper_id} to keeper {target_keeper_id}")
+            
+        except Exception as e:
+            print(f"Error in migrate_data_from_replica: {e}")
+            traceback.print_exc()
 
     def get_date_list_from_replica(self, keeper_id):
-        """从replica获取所有日期列表"""
-        print(f"Getting date list from replica of keeper {keeper_id}")
-        
-        # 添加重试机制
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            if retry_count > 0:
-                print(f"Retry attempt {retry_count} of {max_retries} for getting date list from replica of keeper {keeper_id}")
-                time.sleep(1)  # 重试前等待1秒
-                
-            retry_count += 1
+        """从replica获取日期列表"""
+        try:
+            print(f"Getting date list from replica of keeper {keeper_id}")
             
-            try:
-                # 创建新的连接和通道
-                temp_connection = None
-                
+            # 如果之前已经获取过日期列表，直接使用本地缓存
+            if hasattr(self, 'replica_date_cache') and keeper_id in self.replica_date_cache:
+                print(f"Using cached date list for keeper {keeper_id} with {len(self.replica_date_cache[keeper_id])} dates")
+                return self.replica_date_cache[keeper_id]
+            
+            # 创建临时连接
+            temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
+                'localhost',
+                heartbeat=10,  # 较短的心跳间隔
+                blocked_connection_timeout=30  # 较短的阻塞超时
+            ))
+            temp_channel = temp_connection.channel()
+            
+            # 创建临时队列接收响应
+            result = temp_channel.queue_declare(queue='', exclusive=True)
+            temp_queue = result.method.queue
+            
+            # 生成一个唯一的correlation_id
+            correlation_id = str(uuid.uuid4())
+            
+            # 创建请求消息
+            request_message = create_message('GET_DATE_LIST', {})
+            
+            # 设置接收响应标志
+            response_received = False
+            date_list = None
+            
+            # 定义回调函数
+            def on_response(ch, method, props, body):
+                nonlocal response_received, date_list
+                if props.correlation_id == correlation_id:
+                    try:
+                        message = parse_message(body)
+                        if message.get('type') == 'GET_DATE_LIST_RESULT':
+                            result_data = message.get('data', {})
+                            if result_data.get('success'):
+                                date_list = result_data.get('dates', [])
+                                print(f"Received date list with {len(date_list)} dates from replica of keeper {keeper_id}")
+                            else:
+                                print(f"Error in replica response: {result_data.get('error', 'Unknown error')}")
+                        else:
+                            print(f"Unexpected response type: {message.get('type')}")
+                    except Exception as e:
+                        print(f"Error parsing response: {e}")
+                        traceback.print_exc()
+                    
+                    response_received = True
+            
+            # 设置回调
+            temp_channel.basic_consume(
+                queue=temp_queue,
+                on_message_callback=on_response,
+                auto_ack=True
+            )
+            
+            # 发送请求
+            print(f"Sending date list request to replica queue replica_{keeper_id}")
+            temp_channel.basic_publish(
+                exchange='',
+                routing_key=f'replica_{keeper_id}',
+                properties=pika.BasicProperties(
+                    reply_to=temp_queue,
+                    correlation_id=correlation_id
+                ),
+                body=request_message
+            )
+            
+            # 等待响应或超时 (使用更短的超时时间)
+            timeout = 15  # 缩短超时时间至15秒
+            start_time = time.time()
+            
+            while not response_received and time.time() - start_time < timeout:
                 try:
-                    temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
-                        host='localhost',
-                        connection_attempts=3,
-                        retry_delay=1,
-                        socket_timeout=5
-                    ))
-                    temp_channel = temp_connection.channel()
+                    # 每次只处理短时间的事件，避免长时间阻塞
+                    temp_connection.process_data_events(time_limit=0.5)
                     
-                    # 声明replica队列，确保它存在
-                    replica_queue = f'replica_{keeper_id}'
-                    try:
-                        temp_channel.queue_declare(queue=replica_queue, passive=True)
-                        print(f"Successfully connected to replica queue: {replica_queue}")
-                    except pika.exceptions.ChannelClosedByBroker as e:
-                        print(f"Replica queue {replica_queue} does not exist: {e}")
-                        if temp_connection:
-                            temp_connection.close()
-                        return None
-                    
-                    # 创建临时队列
-                    result = temp_channel.queue_declare(queue='', exclusive=True)
-                    callback_queue = result.method.queue
-                    
-                    # 设置响应变量
-                    response = None
-                    
-                    def on_response(ch, method, props, body):
-                        nonlocal response
-                        if props.correlation_id == corr_id:
-                            try:
-                                response = parse_message(body)
-                                ch.basic_ack(delivery_tag=method.delivery_tag)
-                            except Exception as e:
-                                print(f"Error parsing response: {e}")
-                                traceback.print_exc()
-                    
-                    # 设置消费者
-                    temp_channel.basic_consume(
-                        queue=callback_queue,
-                        on_message_callback=on_response,
-                        auto_ack=False
-                    )
-                    
-                    # 创建相关ID
-                    corr_id = str(uuid.uuid4())
-                    
-                    # 发送请求获取日期列表
-                    request_message = create_message('GET_DATE_LIST', {})
-                    print(f"Sending request to get date list from replica queue {replica_queue}")
-                    
-                    temp_channel.basic_publish(
-                        exchange='',
-                        routing_key=replica_queue,
-                        properties=pika.BasicProperties(
-                            reply_to=callback_queue,
-                            correlation_id=corr_id,
-                        ),
-                        body=request_message
-                    )
-                    
-                    # 等待响应，设置超时
-                    start_time = time.time()
-                    timeout = 10  # 10秒超时
-                    
-                    while response is None and time.time() - start_time < timeout:
-                        try:
-                            temp_connection.process_data_events(time_limit=0.1)
-                        except Exception as e:
-                            print(f"Error processing events: {e}")
-                            traceback.print_exc()
-                            break
-                    
-                    # 清理资源
-                    try:
-                        temp_channel.queue_delete(queue=callback_queue)
-                    except Exception as e:
-                        print(f"Error deleting queue: {e}")
-                    
-                    try:
-                        temp_connection.close()
-                    except Exception as e:
-                        print(f"Error closing connection: {e}")
-                    
-                    # 检查是否收到响应
-                    if response is None:
-                        print(f"Failed to get date list from replica of keeper {keeper_id} (timeout)")
-                        continue  # 重试
-                    
-                    # 处理响应
-                    if response.get('type') == 'GET_DATE_LIST_RESULT':
-                        result_data = response.get('data', {})
-                        if not result_data.get('success', False):
-                            print(f"Error in replica response: {result_data.get('error', 'Unknown error')}")
-                            continue  # 重试
-                        
-                        date_list = result_data.get('dates', [])
-                        print(f"Received {len(date_list)} dates from replica of keeper {keeper_id}")
-                        return date_list
-                    else:
-                        print(f"Unexpected response type: {response.get('type')}")
-                        continue  # 重试
-                    
+                    # 每3秒输出等待状态
+                    if int(time.time() - start_time) % 3 == 0 and int(time.time() - start_time) > 0:
+                        print(f"Still waiting for date list response... {int(time.time() - start_time)}/{timeout}s")
                 except Exception as e:
-                    print(f"Error getting date list: {e}")
-                    traceback.print_exc()
-                    if temp_connection:
-                        try:
-                            temp_connection.close()
-                        except:
-                            pass
-                    continue  # 重试
-                    
+                    print(f"Error processing events: {e}")
+                    # 如果是连接错误，中断等待
+                    if isinstance(e, (pika.exceptions.ConnectionClosed, 
+                                     pika.exceptions.AMQPConnectionError,
+                                     pika.exceptions.ConnectionClosedByBroker)):
+                        print("Connection error, terminating wait loop")
+                        break
+            
+            # 关闭临时连接
+            try:
+                temp_connection.close()
             except Exception as e:
-                print(f"Critical error getting date list: {e}")
-                traceback.print_exc()
-                continue  # 重试
-        
-        print(f"Failed to get date list after {max_retries} attempts")
-        return None
+                print(f"Error closing temporary connection: {e}")
+            
+            if not response_received:
+                print(f"Timeout getting date list from replica of keeper {keeper_id}")
+                return []
+            
+            # 缓存获取到的日期列表
+            if date_list:
+                if not hasattr(self, 'replica_date_cache'):
+                    self.replica_date_cache = {}
+                self.replica_date_cache[keeper_id] = date_list
+            
+            return date_list
+            
+        except Exception as e:
+            print(f"Error getting date list from replica: {e}")
+            traceback.print_exc()
+            return []
 
     def get_data_batch_from_replica(self, keeper_id, date_list):
-        """从replica获取指定日期的数据批次"""
-        if not date_list:
-            return {}
+        """从replica获取批量日期的数据"""
+        try:
+            # 减小批量获取的日期数量，避免消息过大
+            MAX_DATES_PER_BATCH = 50  # 降低每批次的日期数量
             
-        print(f"Getting data for {len(date_list)} dates from replica of keeper {keeper_id}")
-        
-        # 添加重试机制
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            if retry_count > 0:
-                print(f"Retry attempt {retry_count} of {max_retries} for getting data batch from replica of keeper {keeper_id}")
-                time.sleep(1)  # 重试前等待1秒
-                
-            retry_count += 1
+            if len(date_list) > MAX_DATES_PER_BATCH:
+                # 如果日期太多，分批获取
+                all_data = {}
+                for i in range(0, len(date_list), MAX_DATES_PER_BATCH):
+                    batch = date_list[i:i+MAX_DATES_PER_BATCH]
+                    self.log(f"Getting sub-batch {i//MAX_DATES_PER_BATCH + 1} with {len(batch)} dates from replica of keeper {keeper_id}")
+                    batch_data = self.get_data_batch_from_replica(keeper_id, batch)
+                    if batch_data:
+                        all_data.update(batch_data)
+                    # 添加短暂延迟，避免连接过载
+                    time.sleep(0.1)
+                return all_data
             
+            self.log(f"Getting data for {len(date_list)} dates from replica of keeper {keeper_id}")
+            
+            # 创建临时队列接收响应
+            temp_connection = None
             try:
-                # 创建新的连接和通道
-                temp_connection = None
+                temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
+                    'localhost',
+                    heartbeat=30,  # 增加心跳检测
+                    blocked_connection_timeout=60  # 增加阻塞超时
+                ))
+                temp_channel = temp_connection.channel()
                 
-                try:
-                    temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
-                        host='localhost',
-                        connection_attempts=3,
-                        retry_delay=1,
-                        socket_timeout=10  # 增加超时时间
-                    ))
-                    temp_channel = temp_connection.channel()
+                result = temp_channel.queue_declare(queue='', exclusive=True)
+                temp_queue = result.method.queue
+                
+                # 生成一个唯一的correlation_id
+                correlation_id = str(uuid.uuid4())
+                
+                # 发送获取数据批量请求
+                request = {
+                    'dates': date_list
+                }
+                
+                # 发送请求
+                self.log(f"Sending request to get data batch from replica queue replica_{keeper_id}")
+                temp_channel.basic_publish(
+                    exchange='',
+                    routing_key=f'replica_{keeper_id}',
+                    properties=pika.BasicProperties(
+                        reply_to=temp_queue,
+                        correlation_id=correlation_id
+                    ),
+                    body=create_message('GET_DATA_BATCH', request)
+                )
+                
+                # 设置接收超时时间
+                timeout = 20  # 增加超时时间
+                
+                # 等待响应
+                response_received = False
+                batch_data = None
+                
+                def on_response(ch, method, props, body):
+                    nonlocal response_received, batch_data
                     
-                    # 声明replica队列，确保它存在
-                    replica_queue = f'replica_{keeper_id}'
-                    try:
-                        temp_channel.queue_declare(queue=replica_queue, passive=True)
-                    except pika.exceptions.ChannelClosedByBroker as e:
-                        print(f"Replica queue {replica_queue} does not exist: {e}")
-                        if temp_connection:
-                            temp_connection.close()
-                        return None
-                    
-                    # 创建临时队列
-                    result = temp_channel.queue_declare(queue='', exclusive=True)
-                    callback_queue = result.method.queue
-                    
-                    # 设置响应变量
-                    response = None
-                    
-                    def on_response(ch, method, props, body):
-                        nonlocal response
-                        if props.correlation_id == corr_id:
-                            try:
-                                response = parse_message(body)
-                                ch.basic_ack(delivery_tag=method.delivery_tag)
-                            except Exception as e:
-                                print(f"Error parsing response: {e}")
-                                traceback.print_exc()
-                    
-                    # 设置消费者
-                    temp_channel.basic_consume(
-                        queue=callback_queue,
-                        on_message_callback=on_response,
-                        auto_ack=False
-                    )
-                    
-                    # 创建相关ID
-                    corr_id = str(uuid.uuid4())
-                    
-                    # 发送请求获取指定日期的数据
-                    request_message = create_message('GET_DATA_BATCH', {
-                        'dates': date_list
-                    })
-                    print(f"Sending request to get data batch from replica queue {replica_queue}")
-                    
-                    temp_channel.basic_publish(
-                        exchange='',
-                        routing_key=replica_queue,
-                        properties=pika.BasicProperties(
-                            reply_to=callback_queue,
-                            correlation_id=corr_id,
-                        ),
-                        body=request_message
-                    )
-                    
-                    # 等待响应，设置超时
-                    start_time = time.time()
-                    timeout = 20  # 20秒超时
-                    
-                    while response is None and time.time() - start_time < timeout:
+                    if props.correlation_id == correlation_id:
                         try:
-                            temp_connection.process_data_events(time_limit=0.1)
-                            if (time.time() - start_time) % 5 < 0.1:  # 每5秒打印一次
-                                print(f"Still waiting for batch data response... {int(time.time() - start_time)}/{timeout}")
+                            message = parse_message(body)
+                            if message.get('type') == 'GET_DATA_BATCH_RESULT':
+                                response_data = message.get('data', {})
+                                if response_data.get('success'):
+                                    batch_data = response_data.get('data', {})
+                                    self.log(f"Received data for {len(batch_data)} dates from replica of keeper {keeper_id}")
+                                else:
+                                    self.log(f"Failed to get data batch from replica of keeper {keeper_id}: {response_data.get('error')}")
+                            else:
+                                self.log(f"Received unexpected message type: {message.get('type')}")
+                            
+                            response_received = True
                         except Exception as e:
-                            print(f"Error processing events: {e}")
+                            self.log(f"Error parsing response: {e}")
                             traceback.print_exc()
+                            response_received = True  # 防止无限等待
+                
+                # 设置回调
+                temp_channel.basic_consume(
+                    queue=temp_queue,
+                    on_message_callback=on_response,
+                    auto_ack=True
+                )
+                
+                # 等待响应或超时
+                start_time = time.time()
+                wait_count = 0
+                
+                while not response_received and time.time() - start_time < timeout:
+                    # 使用更安全的方式处理消息
+                    try:
+                        temp_connection.process_data_events(time_limit=0.5)  # 缩短单次处理时间
+                    except Exception as e:
+                        self.log(f"Error processing events: {e}")
+                        # 如果是严重错误就中断等待
+                        if "ConnectionClosedByBroker" in str(e):
+                            self.log("Connection closed by broker, terminating wait loop")
                             break
                     
-                    # 清理资源
-                    try:
-                        temp_channel.queue_delete(queue=callback_queue)
-                    except Exception as e:
-                        print(f"Error deleting queue: {e}")
-                    
+                    wait_count += 1
+                    if wait_count % 2 == 0:  # 每1秒输出一次等待状态
+                        self.log(f"Still waiting for batch data response... {wait_count//2}/{timeout//2}")
+                
+                if not response_received:
+                    self.log(f"Timeout waiting for data batch from replica of keeper {keeper_id}")
+                
+                return batch_data
+                
+            finally:
+                # 确保关闭临时连接
+                if temp_connection and temp_connection.is_open:
                     try:
                         temp_connection.close()
                     except Exception as e:
-                        print(f"Error closing connection: {e}")
-                    
-                    # 检查是否收到响应
-                    if response is None:
-                        print(f"Failed to get data batch from replica of keeper {keeper_id} (timeout)")
-                        continue  # 重试
-                    
-                    # 处理响应
-                    if response.get('type') == 'GET_DATA_BATCH_RESULT':
-                        result_data = response.get('data', {})
-                        if not result_data.get('success', False):
-                            print(f"Error in replica response: {result_data.get('error', 'Unknown error')}")
-                            continue  # 重试
+                        self.log(f"Error closing temporary connection: {e}")
                         
-                        batch_data = result_data.get('data', {})
-                        print(f"Received data for {len(batch_data)} dates from replica of keeper {keeper_id}")
-                        return batch_data
-                    else:
-                        print(f"Unexpected response type: {response.get('type')}")
-                        continue  # 重试
-                    
-                except Exception as e:
-                    print(f"Error getting data batch: {e}")
-                    traceback.print_exc()
-                    if temp_connection:
-                        try:
-                            temp_connection.close()
-                        except:
-                            pass
-                    continue  # 重试
-                    
-            except Exception as e:
-                print(f"Critical error getting data batch: {e}")
-                traceback.print_exc()
-                continue  # 重试
-        
-        print(f"Failed to get data batch after {max_retries} attempts")
-        return None
+        except Exception as e:
+            self.log(f"Error getting data batch from replica: {e}")
+            traceback.print_exc()
+            return None
 
     def terminate_replica(self, keeper_id):
         """Terminate the replica of a keeper"""
@@ -2031,6 +1979,64 @@ class Manager:
         if filename not in self.date_file_cache[date]:
             self.date_file_cache[date].append(filename)
             
+    def get_key_for_date(self, date):
+        """根据日期生成用于一致性哈希的键"""
+        # 直接使用日期作为键
+        return date
+        
+    def get_keeper_id_for_key(self, key):
+        """根据键计算应该存储在哪个keeper上"""
+        # 使用一致性哈希环获取节点
+        node = self.hash_ring.get_node(key)
+        if node:
+            # 从"keeper_X"中提取keeper ID
+            return int(node.split('_')[1])
+        else:
+            # 如果没有可用节点，返回默认值
+            available_keepers = [i for i in range(self.num_keepers) 
+                               if self.keepers[i] is not None and 
+                               (i not in self.keeper_status or self.keeper_status[i])]
+            if available_keepers:
+                return available_keepers[0]
+            return None
+
+    def handle_connection_error(self, error_msg=""):
+        """处理RabbitMQ连接错误，尝试重新连接"""
+        try:
+            print(f"RabbitMQ连接错误{': ' + error_msg if error_msg else ''}，尝试重新连接...")
+            
+            # 关闭旧连接
+            if self.connection and self.connection.is_open:
+                try:
+                    self.connection.close()
+                except:
+                    pass
+            
+            # 重新建立连接
+            self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+            self.channel = self.connection.channel()
+            
+            # 重新声明必要的队列
+            self.channel.queue_declare(queue=MANAGER_QUEUE)
+            self.channel.queue_declare(queue=CLIENT_QUEUE)
+            
+            for i in range(self.num_keepers):
+                if i not in self.keeper_status or self.keeper_status[i]:
+                    self.channel.queue_declare(queue=f'keeper_{i}')
+            
+            # 重新设置消费者
+            self.channel.basic_consume(
+                queue=MANAGER_QUEUE,
+                on_message_callback=self.process_client_message,
+                auto_ack=True
+            )
+            
+            print("RabbitMQ连接已恢复")
+            return True
+        except Exception as e:
+            print(f"重新连接失败: {e}")
+            return False
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Start the distributed storage system manager')
     parser.add_argument('num_keepers', type=int, nargs='?', default=3, 
