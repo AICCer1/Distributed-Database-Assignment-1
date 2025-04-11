@@ -70,6 +70,9 @@ class Keeper:
             if msg_type == 'STORE':
                 self.handle_store(data)
                 self.send_to_replica(body)
+            elif msg_type == 'STORE_BATCH':
+                self.handle_store_batch(data)
+                self.send_to_replica(body)
             elif msg_type == 'GET':
                 # 添加对data参数的检查
                 if data is None:
@@ -732,6 +735,94 @@ class Keeper:
                     ),
                     body=create_message('SOURCE_FILES_RESULT', error_response)
                 )
+
+    def handle_store_batch(self, data):
+        """批量处理多个日期的数据，提高性能"""
+        batch_data = data.get('batch_data', {})
+        source_file = data.get('source_file', 'unknown')
+        
+        if not batch_data:
+            self.log(f"Received empty batch data", True)
+            return
+            
+        self.log(f"Processing batch of {len(batch_data)} dates from {source_file}")
+        
+        for date, date_data in batch_data.items():
+            # 提取数据
+            records = date_data.get('data', [])
+            column_names = date_data.get('column_names', [])
+            
+            if not records:
+                continue
+                
+            # 检查是否已存在该日期的数据
+            if date in self.data:
+                # 获取现有数据
+                existing_data = self.data[date]
+                
+                # 如果是旧格式（列表），转换为新格式
+                if isinstance(existing_data, list):
+                    existing_data = {
+                        'datasets': [
+                            {
+                                'data': existing_data,
+                                'column_names': [],
+                                'source_file': 'unknown'
+                            }
+                        ]
+                    }
+                
+                # 如果是旧的字典格式（没有datasets字段），转换为新格式
+                elif isinstance(existing_data, dict) and 'datasets' not in existing_data:
+                    existing_data = {
+                        'datasets': [
+                            {
+                                'data': existing_data.get('data', []),
+                                'column_names': existing_data.get('column_names', []),
+                                'source_file': 'unknown'
+                            }
+                        ]
+                    }
+                
+                # 检查是否已存在相同来源的数据集
+                found_existing_dataset = False
+                for dataset in existing_data['datasets']:
+                    if dataset.get('source_file') == source_file:
+                        # 已存在相同来源的数据集，跳过
+                        found_existing_dataset = True
+                        self.log(f"Dataset from {source_file} for date {date} already exists, skipping")
+                        break
+                
+                # 如果没有找到相同来源的数据集，添加新的数据集
+                if not found_existing_dataset:
+                    existing_data['datasets'].append({
+                        'data': records,
+                        'column_names': column_names,
+                        'source_file': source_file
+                    })
+                    self.log(f"Added new dataset from {source_file} for date {date}")
+                
+                self.data[date] = existing_data
+                
+            else:
+                # 创建新的数据项
+                self.data[date] = {
+                    'datasets': [
+                        {
+                            'data': records,
+                            'column_names': column_names,
+                            'source_file': source_file
+                        }
+                    ]
+                }
+                self.log(f"Created new entry for date {date} from {source_file}")
+        
+        # 批量发送到replica
+        self.log(f"Sending batch data to replica")
+        self.send_to_replica(create_message('REPLICATE_BATCH', {
+            'batch_data': batch_data,
+            'source_file': source_file
+        }))
 
 if __name__ == "__main__":
     print(f"Starting storage device process: {os.getpid()}")

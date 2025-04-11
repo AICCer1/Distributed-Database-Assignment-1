@@ -213,12 +213,6 @@ class Manager:
                                 'source_file': filename
                             }
                         date_records[standard_date]['data'].append(record)
-                        
-                        # 完全禁用替代日期格式的生成
-                        # alt_formats = self.generate_alternative_date_formats(standard_date)
-                        # for alt_date in alt_formats:
-                        #     if alt_date not in date_records:
-                        #         date_records[alt_date] = date_records[standard_date]
                 except Exception as e:
                     print(f"Error processing date {date_str}: {e}")
                     continue
@@ -250,86 +244,86 @@ class Manager:
                 'message': f"Grouped {len(records)} records into {actual_date_entries} unique dates"
             }))
             
-            # 发送数据到keeper
+            # 发送数据到keeper - 全新设计的高性能数据分配
             dates_processed = 0
             total_dates = len(date_records)
             print(f"Starting to send data to keepers, total dates to process: {total_dates}")
             
-            # 检查哪些日期和文件组合已经存在于系统中
-            existing_date_file_pairs = []
-            for date, date_data in date_records.items():
-                # 使用本地缓存检查日期-文件对是否已存在
-                if date in self.date_file_cache:
-                    if filename in self.date_file_cache[date]:
-                        existing_date_file_pairs.append((date, filename))
-                        continue
-                
-                # 如果本地缓存中没有记录，检查数据索引
-                if date in self.data_index:
-                    # 仅检查是否有该日期的活跃keeper
-                    has_active_keeper = False
-                    for keeper_id in self.data_index[date]:
-                        if keeper_id < self.num_keepers and (keeper_id not in self.keeper_status or self.keeper_status[keeper_id]):
-                            has_active_keeper = True
-                            break
-                    
-                    # 只有在发现活跃keeper且本地缓存中没有记录时，才进行远程查询(优化性能)
-                    if has_active_keeper and len(existing_date_file_pairs) < 5:  # 限制最多查询5次，避免性能问题
-                        source_files = self.get_source_files_for_date(date, self.data_index[date][0])
-                        if source_files:
-                            # 更新本地缓存
-                            if date not in self.date_file_cache:
-                                self.date_file_cache[date] = []
-                            self.date_file_cache[date].extend([f for f in source_files if f not in self.date_file_cache[date]])
-                            
-                            # 检查是否存在重复
-                            if filename in source_files:
-                                existing_date_file_pairs.append((date, filename))
+            # 创建日期-keeper_id映射，用于高效去重
+            date_to_keeper = {}
+            skipped_dates = set()  # 用于记录跳过的日期
             
-            # 告知用户已存在的日期-文件对数据
-            if existing_date_file_pairs:
-                existing_count = len(existing_date_file_pairs)
-                self.send_to_client(create_message('LOAD_RESULT', {
-                    'success': True,
-                    'filename': full_path,
-                    'status': 'existing_data',
-                    'existing_dates': existing_count,
-                    'message': f"Found {existing_count} dates with existing data from the same file. Skipping these to avoid duplicates."
-                }))
-                print(f"Skipping {existing_count} dates with existing data from the same file to avoid duplicates")
-            
-            for date, date_data in date_records.items():
-                # 只跳过相同日期和相同文件的数据
-                if (date, filename) in existing_date_file_pairs:
+            # 第1步：为每个日期分配keeper，并检查本地缓存中是否有相同文件的数据
+            for date in date_records.keys():
+                # 首先检查本地缓存，是否已加载此文件的此日期数据
+                if date in self.date_file_cache and filename in self.date_file_cache[date]:
+                    print(f"Date {date} from file {filename} already loaded (local cache), skipping")
+                    skipped_dates.add(date)
                     continue
                     
+                # 没有在本地缓存找到，使用hash环确定keeper
                 keeper_queue = self.hash_ring.get_node(date)
                 if keeper_queue:
                     keeper_id = int(keeper_queue.split('_')[1])
+                    date_to_keeper[date] = keeper_id
                     
+                    # 更新数据索引
                     if date not in self.data_index:
                         self.data_index[date] = []
                     if keeper_id not in self.data_index[date]:
                         self.data_index[date].append(keeper_id)
-                    
-                    # 更新日期-文件缓存
-                    self.update_date_file_cache(date, filename)
-                    
-                    # 添加文件名到数据中，确保后续能正确识别数据源
-                    self.send_to_keeper(keeper_id, create_message('STORE', {
-                        'date': date,
-                        'data': date_data['data'],
-                        'column_names': date_data['column_names'],
-                        'source_file': filename
-                    }))
-                    
-                    dates_processed += 1
-                    # 每处理100个日期发送一次进度通知，但不打印太多信息
-                    if dates_processed % 100 == 0:
-                        progress_percent = (dates_processed / total_dates) * 100
-                        print(f"Progress: {progress_percent:.1f}% - Processed {dates_processed}/{total_dates} dates")
                 else:
-                    print(f"No available keeper found for date: {date}")
+                    print(f"Warning: No keeper available for date {date}")
+            
+            # 报告跳过的日期数
+            if skipped_dates:
+                skip_count = len(skipped_dates)
+                self.send_to_client(create_message('LOAD_RESULT', {
+                    'success': True,
+                    'filename': full_path,
+                    'status': 'existing_data',
+                    'existing_dates': skip_count,
+                    'message': f"Skipping {skip_count} dates with existing data from the same file"
+                }))
+                print(f"Skipping {skip_count} dates with existing data from the same file")
+            
+            # 第2步：批量发送数据到每个keeper (按keeper分组以提高性能)
+            keeper_to_dates = {}
+            for date, keeper_id in date_to_keeper.items():
+                if date in skipped_dates:
+                    continue
+                if keeper_id not in keeper_to_dates:
+                    keeper_to_dates[keeper_id] = []
+                keeper_to_dates[keeper_id].append(date)
+            
+            # 第3步：对每个keeper批量发送数据
+            for keeper_id, dates in keeper_to_dates.items():
+                # 检查keeper是否健康
+                if keeper_id not in self.keeper_status or self.keeper_status[keeper_id]:
+                    batch_size = 50  # 每批发送的日期数量
+                    for i in range(0, len(dates), batch_size):
+                        batch_dates = dates[i:i+batch_size]
+                        batch_data = {}
+                        
+                        # 准备该批次的数据
+                        for date in batch_dates:
+                            batch_data[date] = date_records[date]
+                            # 更新本地缓存
+                            self.update_date_file_cache(date, filename)
+                            dates_processed += 1
+                            
+                        # 发送批次数据
+                        print(f"Sending batch of {len(batch_dates)} dates to keeper {keeper_id}")
+                        self.send_to_keeper(keeper_id, create_message('STORE_BATCH', {
+                            'batch_data': batch_data,
+                            'source_file': filename
+                        }))
+                            
+                        # 每处理一批发送一次进度通知
+                        progress_percent = (dates_processed / (total_dates - len(skipped_dates))) * 100
+                        print(f"Progress: {progress_percent:.1f}% - Processed {dates_processed}/{total_dates - len(skipped_dates)} dates")
+                else:
+                    print(f"Keeper {keeper_id} is not healthy, can't send data")
             
             print(f"All data sent to keepers. Processed {dates_processed}/{total_dates} dates")
             
@@ -339,16 +333,17 @@ class Manager:
                 
                 # Send each date's data to the DataMart
                 for date, date_data in date_records.items():
-                    # Create data object for the DataMart
-                    datamart_data = {
-                        'date': date,
-                        'data': date_data['data'],
-                        'column_names': date_data['column_names'],
-                        'source_file': filename
-                    }
-                    
-                    # Send the data to the DataMart
-                    self.send_to_datamart(create_message('NEW_DATA', datamart_data))
+                    if date not in skipped_dates:  # 只发送未跳过的日期数据
+                        # Create data object for the DataMart
+                        datamart_data = {
+                            'date': date,
+                            'data': date_data['data'],
+                            'column_names': date_data['column_names'],
+                            'source_file': filename
+                        }
+                        
+                        # Send the data to the DataMart
+                        self.send_to_datamart(create_message('NEW_DATA', datamart_data))
                 
                 print(f"All data sent to DataMart for temperature analysis")
             except Exception as e:

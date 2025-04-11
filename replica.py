@@ -68,6 +68,8 @@ class Replica:
                     self.log(f"Replica {self.keeper_id} cannot reply to GET request: no reply_to queue provided", True)
             elif msg_type == 'REPLICATE':
                 self.handle_replicate(data)
+            elif msg_type == 'REPLICATE_BATCH':
+                self.handle_replicate_batch(data)
             elif msg_type == 'GET_ALL_DATA':
                 self.handle_get_all_data(properties)
             elif msg_type == 'GET_DATE_LIST':
@@ -213,6 +215,83 @@ class Replica:
             return {'success': True}
         except Exception as e:
             self.log(f"Error processing REPLICATE request: {e}", True)
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
+
+    def handle_replicate_batch(self, data):
+        """批量处理多个日期的复制请求"""
+        try:
+            batch_data = data.get('batch_data', {})
+            source_file = data.get('source_file', 'unknown')
+            
+            if not batch_data:
+                self.log(f"Received empty batch data for replication", True)
+                return {'success': False, 'error': 'Empty batch data'}
+                
+            self.log(f"Replicating batch of {len(batch_data)} dates from {source_file}")
+            
+            # 批量处理每个日期的数据
+            for date, date_data in batch_data.items():
+                records = date_data.get('data', [])
+                column_names = date_data.get('column_names', [])
+                
+                if not records:
+                    continue
+                    
+                # 使用datasets格式存储
+                if date not in self.data:
+                    self.data[date] = {
+                        'datasets': [{
+                            'data': records,
+                            'column_names': column_names,
+                            'source_file': source_file
+                        }]
+                    }
+                else:
+                    # 日期已存在，需要检查是否有相同来源的数据集
+                    existing_data = self.data[date]
+                    
+                    # 如果是列表或旧格式，转换为新格式
+                    if isinstance(existing_data, list):
+                        existing_data = {
+                            'datasets': [{
+                                'data': existing_data,
+                                'column_names': [],
+                                'source_file': 'unknown'
+                            }]
+                        }
+                    elif isinstance(existing_data, dict) and 'datasets' not in existing_data:
+                        existing_data = {
+                            'datasets': [{
+                                'data': existing_data.get('data', []),
+                                'column_names': existing_data.get('column_names', []),
+                                'source_file': existing_data.get('source_file', 'unknown')
+                            }]
+                        }
+                    
+                    # 检查是否已存在来自相同文件的数据集
+                    found_existing = False
+                    for dataset in existing_data['datasets']:
+                        if dataset.get('source_file') == source_file:
+                            # 已存在该来源的数据集，跳过
+                            found_existing = True
+                            break
+                    
+                    # 如果没有找到相同来源的数据集，添加新数据集
+                    if not found_existing:
+                        existing_data['datasets'].append({
+                            'data': records,
+                            'column_names': column_names,
+                            'source_file': source_file
+                        })
+                    
+                    self.data[date] = existing_data
+            
+            self.log(f"Batch replication completed for {len(batch_data)} dates")
+            return {'success': True}
+            
+        except Exception as e:
+            self.log(f"Error processing REPLICATE_BATCH message: {e}", True)
             traceback.print_exc()
             return {'success': False, 'error': str(e)}
 
