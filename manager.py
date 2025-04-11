@@ -301,7 +301,7 @@ class Manager:
             for keeper_id, dates in keeper_to_dates.items():
                 # 检查keeper是否健康
                 if keeper_id not in self.keeper_status or self.keeper_status[keeper_id]:
-                    batch_size = 50  # 每批发送的日期数量
+                    batch_size = 300  # 增加每批发送的日期数量
                     for i in range(0, len(dates), batch_size):
                         batch_dates = dates[i:i+batch_size]
                         batch_data = {}
@@ -315,10 +315,30 @@ class Manager:
                             
                         # 发送批次数据
                         print(f"Sending batch of {len(batch_dates)} dates to keeper {keeper_id}")
-                        self.send_to_keeper_safe(keeper_id, create_message('STORE_BATCH', {
+                        
+                        # 使用新的批量发送功能
+                        message = create_message('STORE_BATCH', {
                             'batch_data': batch_data,
                             'source_file': filename
-                        }), is_migration=False)  # 加载数据不视为迁移数据
+                        })
+                        success = self.send_to_keeper_safe(keeper_id, message, is_migration=False)
+                        
+                        if not success:
+                            print(f"Warning: Failed to send batch to keeper {keeper_id}, will retry with smaller batches")
+                            # 如果批量发送失败，尝试更小的批次
+                            small_batch_size = 50
+                            for j in range(0, len(batch_dates), small_batch_size):
+                                small_batch = batch_dates[j:j+small_batch_size]
+                                small_batch_data = {}
+                                for date in small_batch:
+                                    small_batch_data[date] = date_records[date]
+                                    
+                                print(f"Sending smaller batch of {len(small_batch)} dates to keeper {keeper_id}")
+                                small_message = create_message('STORE_BATCH', {
+                                    'batch_data': small_batch_data,
+                                    'source_file': filename
+                                })
+                                self.send_to_keeper_safe(keeper_id, small_message, is_migration=False)
                             
                         # 每处理一批发送一次进度通知
                         progress_percent = (dates_processed / (total_dates - len(skipped_dates))) * 100
@@ -856,7 +876,12 @@ class Manager:
         当is_migration=True时使用独立连接，避免主连接崩溃"""
         if not is_migration:
             # 使用主连接发送
-            return self.send_to_keeper(keeper_id, message)
+            try:
+                self.send_to_keeper(keeper_id, message)
+                return True
+            except Exception as e:
+                print(f"Error sending message to keeper {keeper_id}: {e}")
+                return False
             
         # 使用独立连接发送迁移数据
         temp_connection = None
@@ -864,23 +889,84 @@ class Manager:
             # 创建新的临时连接
             temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
                 'localhost',
-                heartbeat=30,
-                blocked_connection_timeout=60
+                heartbeat=60,  # 较长的心跳间隔
+                blocked_connection_timeout=120,  # 较长的阻塞超时
+                socket_timeout=60  # 较长的socket超时
             ))
             temp_channel = temp_connection.channel()
             
-            # 使用临时连接发送消息
+            # 增加预取数量提高吞吐量
+            temp_channel.basic_qos(prefetch_count=10)
+            
+            # 使用临时连接发送消息，为迁移数据设置非持久化模式
             temp_channel.basic_publish(
                 exchange='',
                 routing_key=f'keeper_{keeper_id}',
+                properties=pika.BasicProperties(
+                    delivery_mode=1  # 非持久化模式，提高性能
+                ),
                 body=message
             )
             
-            # 关闭临时连接
+            # 快速关闭临时连接
             temp_connection.close()
             return True
         except Exception as e:
             print(f"Error sending migration data to keeper {keeper_id}: {e}")
+            if temp_connection and temp_connection.is_open:
+                try:
+                    temp_connection.close()
+                except:
+                    pass
+            return False
+            
+    def send_batch_to_keeper_safe(self, keeper_id, date_messages, is_migration=True):
+        """批量发送多个日期数据到keeper，提高性能"""
+        if not date_messages:
+            return True
+            
+        # 使用独立连接批量发送数据
+        temp_connection = None
+        try:
+            # 创建新的临时连接
+            temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
+                'localhost',
+                heartbeat=60,
+                blocked_connection_timeout=120
+            ))
+            temp_channel = temp_connection.channel()
+            
+            # 设置发送确认模式提高可靠性
+            temp_channel.confirm_delivery()
+            
+            # 批量发送所有消息
+            success_count = 0
+            for date, message in date_messages.items():
+                try:
+                    temp_channel.basic_publish(
+                        exchange='',
+                        routing_key=f'keeper_{keeper_id}',
+                        properties=pika.BasicProperties(
+                            delivery_mode=1  # 非持久化模式提高性能
+                        ),
+                        body=message
+                    )
+                    success_count += 1
+                except Exception as e:
+                    print(f"Error sending data for date {date}: {e}")
+            
+            # 关闭连接
+            temp_connection.close()
+            
+            # 如果全部成功则返回True，否则返回部分成功
+            if success_count == len(date_messages):
+                return True
+            else:
+                print(f"Partially successful batch: {success_count}/{len(date_messages)} messages sent")
+                return success_count > 0
+                
+        except Exception as e:
+            print(f"Error in batch sending to keeper {keeper_id}: {e}")
             if temp_connection and temp_connection.is_open:
                 try:
                     temp_connection.close()
@@ -1235,8 +1321,8 @@ class Manager:
                     for target_id, dates in migration_groups.items():
                         print(f"Migrating {len(dates)} dates from keeper {failed_keeper_id} to keeper {target_id}")
                         
-                        # 分批迁移数据，每批最多50个日期
-                        batch_size = 200
+                        # 分批迁移数据，增加批次大小提高性能
+                        batch_size = 300  # 增加批处理大小提高性能
                         for i in range(0, len(dates), batch_size):
                             batch = dates[i:i+batch_size]
                             print(f"Processing migration batch {i//batch_size + 1}/{(len(dates)+batch_size-1)//batch_size}")
@@ -1248,43 +1334,89 @@ class Manager:
                                 migration_success = False
                                 continue
                             
-                            # 发送数据到目标keeper
-                            migrated_count = 0
-                            for date, date_data in batch_data.items():
-                                try:
-                                    # 标记为迁移数据
-                                    success = self.send_to_keeper_safe(target_id, create_message('STORE', {
+                            # 使用批量发送提高性能
+                            print(f"Preparing to migrate {len(batch_data)} dates in one batch")
+                            
+                            try:
+                                # 准备批量消息
+                                message_batch = {}
+                                for date, date_data in batch_data.items():
+                                    # 为每个日期创建消息
+                                    message = create_message('STORE', {
                                         'date': date,
                                         'data': date_data,
                                         'source_file': 'migration'
-                                    }), is_migration=True)
-                                    
-                                    if success:
-                                        # 更新数据索引
+                                    })
+                                    message_batch[date] = message
+                                
+                                # 使用批量发送功能
+                                batch_success = self.send_batch_to_keeper_safe(target_id, message_batch)
+                                
+                                if batch_success:
+                                    # 更新数据索引
+                                    for date in batch_data.keys():
                                         if date in self.data_index:
                                             if failed_keeper_id in self.data_index[date]:
                                                 self.data_index[date].remove(failed_keeper_id)
                                             if target_id not in self.data_index[date]:
                                                 self.data_index[date].append(target_id)
-                                        
-                                        migrated_count += 1
-                                        if migrated_count % 10 == 0:
-                                            print(f"Migrated {migrated_count}/{len(batch_data)} dates in current batch")
-                                    else:
-                                        print(f"Failed to send data for date {date}, will try again later")
-                                        migration_success = False
                                     
-                                    # 添加小延迟避免消息堆积
-                                    # if migrated_count % 2 == 0:  # 每2个日期添加一次延迟
-                                    #     time.sleep(0.1)  # 增加延迟时间
-                                        
-                                except Exception as e:
-                                    print(f"Error sending data for date {date}: {e}")
-                                    traceback.print_exc()
+                                    print(f"Successfully migrated batch of {len(batch_data)} dates to keeper {target_id}")
+                                else:
+                                    print(f"Batch migration to keeper {target_id} failed or partially succeeded")
                                     migration_success = False
+                                    
+                                    # 如果批量发送失败，尝试单个发送
+                                    print("Falling back to individual message sending...")
+                                    
+                                    # 单个发送模式
+                                    migrated_count = 0
+                                    total_items = len(batch_data)
+                                    start_time = time.time()
+                                    
+                                    for date, date_data in batch_data.items():
+                                        try:
+                                            # 标记为迁移数据
+                                            success = self.send_to_keeper_safe(target_id, create_message('STORE', {
+                                                'date': date,
+                                                'data': date_data,
+                                                'source_file': 'migration'
+                                            }), is_migration=True)
+                                            
+                                            if success:
+                                                # 更新数据索引
+                                                if date in self.data_index:
+                                                    if failed_keeper_id in self.data_index[date]:
+                                                        self.data_index[date].remove(failed_keeper_id)
+                                                    if target_id not in self.data_index[date]:
+                                                        self.data_index[date].append(target_id)
+                                                
+                                                migrated_count += 1
+                                                # 只在关键进度点打印，减少日志输出量
+                                                if migrated_count % 20 == 0 or migrated_count == total_items:
+                                                    elapsed = time.time() - start_time
+                                                    rate = migrated_count / elapsed if elapsed > 0 else 0
+                                                    print(f"Migrated {migrated_count}/{total_items} dates in batch ({rate:.1f} dates/sec)")
+                                            else:
+                                                print(f"Failed to send data for date {date}")
+                                                migration_success = False
+                                            
+                                            # 每10个日期添加一次微小延迟，避免连接过载但不显著影响性能
+                                            if migrated_count % 10 == 0:
+                                                time.sleep(0.01)  # 减少延迟时间
+                                                
+                                        except Exception as e:
+                                            print(f"Error sending data for date {date}: {e}")
+                                            traceback.print_exc()
+                                            migration_success = False
+                                
+                            except Exception as e:
+                                print(f"Error in batch migration: {e}")
+                                traceback.print_exc()
+                                migration_success = False
                             
-                            # 批次之间添加延迟
-                            time.sleep(0.005)
+                            # 批次之间几乎不添加延迟，最大化性能
+                            time.sleep(0.001)
                     
                     # 数据迁移完成后，终止副本
                     if migration_success:
@@ -1536,20 +1668,24 @@ class Manager:
     def get_data_batch_from_replica(self, keeper_id, date_list):
         """从replica获取批量日期的数据"""
         try:
-            # 减小批量获取的日期数量，避免消息过大
-            MAX_DATES_PER_BATCH = 50  # 降低每批次的日期数量
+            # 为避免消息过大，分批处理，但增加每批量大小
+            MAX_DATES_PER_BATCH = 100  # 增加每批次的日期数量提高性能
             
             if len(date_list) > MAX_DATES_PER_BATCH:
                 # 如果日期太多，分批获取
                 all_data = {}
+                batch_count = (len(date_list) + MAX_DATES_PER_BATCH - 1) // MAX_DATES_PER_BATCH
+                
+                print(f"Splitting {len(date_list)} dates into {batch_count} batches of {MAX_DATES_PER_BATCH}")
+                
                 for i in range(0, len(date_list), MAX_DATES_PER_BATCH):
                     batch = date_list[i:i+MAX_DATES_PER_BATCH]
-                    self.log(f"Getting sub-batch {i//MAX_DATES_PER_BATCH + 1} with {len(batch)} dates from replica of keeper {keeper_id}")
+                    self.log(f"Getting batch {i//MAX_DATES_PER_BATCH + 1}/{batch_count} with {len(batch)} dates")
                     batch_data = self.get_data_batch_from_replica(keeper_id, batch)
                     if batch_data:
                         all_data.update(batch_data)
-                    # 添加短暂延迟，避免连接过载
-                    time.sleep(0.1)
+                    # 减少批次间延迟，提高性能
+                    time.sleep(0.05)
                 return all_data
             
             self.log(f"Getting data for {len(date_list)} dates from replica of keeper {keeper_id}")
@@ -1559,10 +1695,14 @@ class Manager:
             try:
                 temp_connection = pika.BlockingConnection(pika.ConnectionParameters(
                     'localhost',
-                    heartbeat=30,  # 增加心跳检测
-                    blocked_connection_timeout=60  # 增加阻塞超时
+                    heartbeat=60,  # 增加心跳间隔以支持更大的消息
+                    blocked_connection_timeout=120,  # 增加超时时间
+                    socket_timeout=60  # 添加socket超时
                 ))
                 temp_channel = temp_connection.channel()
+                
+                # 增加预取数量，提高吞吐量
+                temp_channel.basic_qos(prefetch_count=10)
                 
                 result = temp_channel.queue_declare(queue='', exclusive=True)
                 temp_queue = result.method.queue
@@ -1582,13 +1722,14 @@ class Manager:
                     routing_key=f'replica_{keeper_id}',
                     properties=pika.BasicProperties(
                         reply_to=temp_queue,
-                        correlation_id=correlation_id
+                        correlation_id=correlation_id,
+                        delivery_mode=1  # 使用非持久化模式提高性能
                     ),
                     body=create_message('GET_DATA_BATCH', request)
                 )
                 
                 # 设置接收超时时间
-                timeout = 20  # 增加超时时间
+                timeout = 60  # 增加超时时间以支持更大批量
                 
                 # 等待响应
                 response_received = False
@@ -1604,9 +1745,10 @@ class Manager:
                                 response_data = message.get('data', {})
                                 if response_data.get('success'):
                                     batch_data = response_data.get('data', {})
-                                    self.log(f"Received data for {len(batch_data)} dates from replica of keeper {keeper_id}")
+                                    item_count = len(batch_data) if batch_data else 0
+                                    self.log(f"Received data for {item_count} dates from replica")
                                 else:
-                                    self.log(f"Failed to get data batch from replica of keeper {keeper_id}: {response_data.get('error')}")
+                                    self.log(f"Failed to get data batch: {response_data.get('error')}")
                             else:
                                 self.log(f"Received unexpected message type: {message.get('type')}")
                             
@@ -1623,14 +1765,13 @@ class Manager:
                     auto_ack=True
                 )
                 
-                # 等待响应或超时
+                # 等待响应或超时，减少日志输出以提高性能
                 start_time = time.time()
-                wait_count = 0
                 
                 while not response_received and time.time() - start_time < timeout:
                     # 使用更安全的方式处理消息
                     try:
-                        temp_connection.process_data_events(time_limit=0.5)  # 缩短单次处理时间
+                        temp_connection.process_data_events(time_limit=1.0)  # 增加单次处理时间以提高效率
                     except Exception as e:
                         self.log(f"Error processing events: {e}")
                         # 如果是严重错误就中断等待
@@ -1638,12 +1779,13 @@ class Manager:
                             self.log("Connection closed by broker, terminating wait loop")
                             break
                     
-                    wait_count += 1
-                    if wait_count % 2 == 0:  # 每1秒输出一次等待状态
-                        self.log(f"Still waiting for batch data response... {wait_count//2}/{timeout//2}")
+                    # 每10秒输出一次等待状态，减少日志输出
+                    elapsed = int(time.time() - start_time)
+                    if elapsed % 10 == 0 and elapsed > 0:
+                        self.log(f"Still waiting for batch data response... {elapsed}/{timeout}s")
                 
                 if not response_received:
-                    self.log(f"Timeout waiting for data batch from replica of keeper {keeper_id}")
+                    self.log(f"Timeout waiting for data batch")
                 
                 return batch_data
                 
