@@ -98,6 +98,8 @@ class Keeper:
                                       properties.correlation_id if properties else None)
             elif msg_type == 'GET_DIRECT':
                 self.handle_get_direct(data)
+            elif msg_type == 'GET_SOURCE_FILES':
+                self.handle_get_source_files(data, properties)
             elif msg_type == 'HEALTH_CHECK':
                 self.handle_health_check(properties)
             elif msg_type == 'PING':
@@ -663,6 +665,73 @@ class Keeper:
             except Exception as e:
                 self.log(f"Error sending ping response: {str(e)}", True)
                 traceback.print_exc()
+
+    def handle_get_source_files(self, data, properties):
+        """处理获取指定日期的源文件列表的请求"""
+        try:
+            if not properties or not properties.reply_to:
+                self.log(f"Cannot respond to SOURCE_FILES query: no reply_to in properties")
+                return
+                
+            date = data.get('date')
+            self.log(f"Getting source files for date: {date}")
+            
+            source_files = []
+            if date in self.data:
+                date_info = self.data[date]
+                
+                # 检查数据结构并提取源文件
+                if isinstance(date_info, list):
+                    # 旧格式数据，没有源文件信息
+                    source_files = ['unknown']
+                elif isinstance(date_info, dict) and 'datasets' in date_info:
+                    # 新格式数据，提取每个数据集的源文件
+                    for dataset in date_info['datasets']:
+                        source_file = dataset.get('source_file', 'unknown')
+                        if source_file and source_file not in source_files:
+                            source_files.append(source_file)
+                elif isinstance(date_info, dict) and 'data' in date_info:
+                    # 旧的字典格式，可能有单个源文件
+                    source_file = date_info.get('source_file', 'unknown')
+                    source_files = [source_file]
+            
+            # 发送响应
+            response_data = {
+                'success': True,
+                'date': date,
+                'source_files': source_files
+            }
+            
+            self.log(f"Source files for date {date}: {source_files}")
+            
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=properties.reply_to,
+                properties=pika.BasicProperties(
+                    correlation_id=properties.correlation_id
+                ),
+                body=create_message('SOURCE_FILES_RESULT', response_data)
+            )
+            
+        except Exception as e:
+            self.log(f"Error getting source files for date {data.get('date', 'unknown')}: {str(e)}", True)
+            
+            # 发送错误响应
+            if properties and properties.reply_to:
+                error_response = {
+                    'success': False,
+                    'date': data.get('date', 'unknown'),
+                    'error': str(e)
+                }
+                
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key=properties.reply_to,
+                    properties=pika.BasicProperties(
+                        correlation_id=properties.correlation_id
+                    ),
+                    body=create_message('SOURCE_FILES_RESULT', error_response)
+                )
 
 if __name__ == "__main__":
     print(f"Starting storage device process: {os.getpid()}")

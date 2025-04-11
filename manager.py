@@ -29,6 +29,7 @@ class Manager:
         self.health_check_running = False
         self.verbose = verbose  # 是否启用详细日志输出
         self.datamart = None    # DataMart process for temperature data analysis
+        self.date_file_cache = {}  # 缓存日期-文件对应关系，避免频繁查询
 
         self.init_rabbitmq()
         
@@ -254,7 +255,54 @@ class Manager:
             total_dates = len(date_records)
             print(f"Starting to send data to keepers, total dates to process: {total_dates}")
             
+            # 检查哪些日期和文件组合已经存在于系统中
+            existing_date_file_pairs = []
             for date, date_data in date_records.items():
+                # 使用本地缓存检查日期-文件对是否已存在
+                if date in self.date_file_cache:
+                    if filename in self.date_file_cache[date]:
+                        existing_date_file_pairs.append((date, filename))
+                        continue
+                
+                # 如果本地缓存中没有记录，检查数据索引
+                if date in self.data_index:
+                    # 仅检查是否有该日期的活跃keeper
+                    has_active_keeper = False
+                    for keeper_id in self.data_index[date]:
+                        if keeper_id < self.num_keepers and (keeper_id not in self.keeper_status or self.keeper_status[keeper_id]):
+                            has_active_keeper = True
+                            break
+                    
+                    # 只有在发现活跃keeper且本地缓存中没有记录时，才进行远程查询(优化性能)
+                    if has_active_keeper and len(existing_date_file_pairs) < 5:  # 限制最多查询5次，避免性能问题
+                        source_files = self.get_source_files_for_date(date, self.data_index[date][0])
+                        if source_files:
+                            # 更新本地缓存
+                            if date not in self.date_file_cache:
+                                self.date_file_cache[date] = []
+                            self.date_file_cache[date].extend([f for f in source_files if f not in self.date_file_cache[date]])
+                            
+                            # 检查是否存在重复
+                            if filename in source_files:
+                                existing_date_file_pairs.append((date, filename))
+            
+            # 告知用户已存在的日期-文件对数据
+            if existing_date_file_pairs:
+                existing_count = len(existing_date_file_pairs)
+                self.send_to_client(create_message('LOAD_RESULT', {
+                    'success': True,
+                    'filename': full_path,
+                    'status': 'existing_data',
+                    'existing_dates': existing_count,
+                    'message': f"Found {existing_count} dates with existing data from the same file. Skipping these to avoid duplicates."
+                }))
+                print(f"Skipping {existing_count} dates with existing data from the same file to avoid duplicates")
+            
+            for date, date_data in date_records.items():
+                # 只跳过相同日期和相同文件的数据
+                if (date, filename) in existing_date_file_pairs:
+                    continue
+                    
                 keeper_queue = self.hash_ring.get_node(date)
                 if keeper_queue:
                     keeper_id = int(keeper_queue.split('_')[1])
@@ -264,6 +312,10 @@ class Manager:
                     if keeper_id not in self.data_index[date]:
                         self.data_index[date].append(keeper_id)
                     
+                    # 更新日期-文件缓存
+                    self.update_date_file_cache(date, filename)
+                    
+                    # 添加文件名到数据中，确保后续能正确识别数据源
                     self.send_to_keeper(keeper_id, create_message('STORE', {
                         'date': date,
                         'data': date_data['data'],
@@ -540,11 +592,20 @@ class Manager:
                                 # 添加keeper_id信息到每个数据集
                                 for dataset in response_content['datasets']:
                                     dataset['keeper_id'] = keeper_id
+                                    # 更新本地文件缓存
+                                    if 'source_file' in dataset and dataset['source_file'] != 'unknown':
+                                        self.update_date_file_cache(standard_date, dataset['source_file'])
+                                
                                 # 添加数据集到结果集合
                                 all_datasets.extend(response_content['datasets'])
                             else:
                                 data = response_content.get('data', [])
                                 column_names = response_content.get('column_names', [])
+                                source_file = response_content.get('source_file', 'unknown')
+                                
+                                # 更新本地文件缓存
+                                if source_file != 'unknown':
+                                    self.update_date_file_cache(standard_date, source_file)
                                 
                                 if data and isinstance(data[0], list) and isinstance(data[0][0], list):
                                     flat_data = []
@@ -556,7 +617,7 @@ class Manager:
                                 new_dataset = {
                                     'data': data,
                                     'column_names': column_names,
-                                    'source_file': response_content.get('source_file', 'unknown'),
+                                    'source_file': source_file,
                                     'keeper_id': keeper_id
                                 }
                                 all_datasets.append(new_dataset)
@@ -650,14 +711,32 @@ class Manager:
             
             # 处理结果
             if data_found and all_datasets:
+                # 对数据集进行去重，避免返回重复数据
+                unique_datasets = []
+                seen_source_files = set()
+                
+                for dataset in all_datasets:
+                    # 使用source_file + data长度作为去重标识
+                    source_file = dataset.get('source_file', 'unknown')
+                    data_len = len(dataset.get('data', []))
+                    dataset_key = f"{source_file}:{data_len}"
+                    
+                    if dataset_key not in seen_source_files:
+                        seen_source_files.add(dataset_key)
+                        unique_datasets.append(dataset)
+                
                 # 计算总记录数
-                total_records = sum(len(dataset.get('data', [])) for dataset in all_datasets)
+                total_records = sum(len(dataset.get('data', [])) for dataset in unique_datasets)
+                
+                # 打印去重信息
+                if len(unique_datasets) < len(all_datasets):
+                    print(f"Removed {len(all_datasets) - len(unique_datasets)} duplicate datasets")
                 
                 # 构建完整响应
                 complete_response = {
                     'date': date_str,
                     'found': True,
-                    'datasets': all_datasets,
+                    'datasets': unique_datasets,  # 使用去重后的数据集
                     'count': total_records,
                     'keepers_queried': keepers_queried  # 添加查询过的keeper节点列表
                 }
@@ -1264,7 +1343,9 @@ class Manager:
         for date, keepers in self.data_index.items():
             if old_keeper_id in keepers:
                 keepers.remove(old_keeper_id)
-                keepers.append(new_keeper_id)
+                # 确保不重复添加keeper_id
+                if new_keeper_id not in keepers:
+                    keepers.append(new_keeper_id)
                 print(f"Updated data index for date {date}: {old_keeper_id} -> {new_keeper_id}")
 
     def migrate_data_from_replica(self, source_keeper_id, target_keeper_id):
@@ -1848,6 +1929,113 @@ class Manager:
         # Give the DataMart time to initialize
         time.sleep(2)
 
+    def get_source_files_for_date(self, date, keeper_id):
+        """查询指定日期在指定keeper上的源文件列表"""
+        try:
+            # print(f"Checking source files for date {date} in keeper {keeper_id}")
+            
+            temp_connection = None
+            try:
+                temp_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+                temp_channel = temp_connection.channel()
+                
+                result = temp_channel.queue_declare(queue='', exclusive=True)
+                temp_queue = result.method.queue
+                
+                response_received = False
+                source_files = []
+                
+                def on_response(ch, method, props, body):
+                    nonlocal response_received, source_files
+                    response_received = True
+                    try:
+                        response = parse_message(body)
+                        response_type = response.get('type')
+                        response_data = response.get('data', {})
+                        
+                        if response_type == 'SOURCE_FILES_RESULT' and response_data.get('success', False):
+                            source_files = response_data.get('source_files', [])
+                    except Exception as e:
+                        print(f"Error parsing source files response: {e}")
+                    
+                    try:
+                        temp_channel.stop_consuming()
+                    except Exception as e:
+                        print(f"Error stopping consumption: {e}")
+                
+                temp_channel.basic_consume(
+                    queue=temp_queue,
+                    on_message_callback=on_response,
+                    auto_ack=True
+                )
+                
+                request_data = {
+                    'date': date
+                }
+                
+                temp_channel.basic_publish(
+                    exchange='',
+                    routing_key=f'keeper_{keeper_id}',
+                    properties=pika.BasicProperties(
+                        reply_to=temp_queue,
+                        correlation_id=str(uuid.uuid4())
+                    ),
+                    body=create_message('GET_SOURCE_FILES', request_data)
+                )
+                
+                # 设置超时时间 - 减少超时时间以加快处理速度
+                timeout_seconds = 1
+                timeout_event = threading.Event()
+                
+                def timeout_thread():
+                    start_time = time.time()
+                    while time.time() - start_time < timeout_seconds:
+                        if timeout_event.is_set() or response_received:
+                            return
+                        time.sleep(0.1)
+                    
+                    if not response_received:
+                        try:
+                            temp_channel.stop_consuming()
+                        except:
+                            pass
+                
+                timer_thread = threading.Thread(target=timeout_thread)
+                timer_thread.daemon = True
+                timer_thread.start()
+                
+                try:
+                    temp_channel.start_consuming()
+                except Exception as e:
+                    print(f"Error during consumption for source files: {e}")
+                
+                timeout_event.set()
+                
+                if temp_connection:
+                    temp_connection.close()
+                
+                return source_files
+            
+            except Exception as e:
+                print(f"Error getting source files: {e}")
+                if temp_connection:
+                    try:
+                        temp_connection.close()
+                    except:
+                        pass
+                return []
+        
+        except Exception as e:
+            print(f"Error in get_source_files_for_date: {e}")
+            return []
+
+    def update_date_file_cache(self, date, filename):
+        """更新日期-文件缓存，记录哪些文件包含特定日期的数据"""
+        if date not in self.date_file_cache:
+            self.date_file_cache[date] = []
+        if filename not in self.date_file_cache[date]:
+            self.date_file_cache[date].append(filename)
+            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Start the distributed storage system manager')
     parser.add_argument('num_keepers', type=int, nargs='?', default=3, 
