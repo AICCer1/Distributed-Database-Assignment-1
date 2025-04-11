@@ -7,6 +7,7 @@ import bisect
 # Constant definitions
 MANAGER_QUEUE = 'manager_queue'
 CLIENT_QUEUE = 'client_queue'
+DATAMART_QUEUE = 'data_mart_queue'
 
 def create_message(msg_type, data=None):
     return json.dumps({

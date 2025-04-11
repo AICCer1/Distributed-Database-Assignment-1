@@ -217,6 +217,16 @@ class Client(cmd.Cmd):
                     print(f"Failed to load file: {error}")
                     print("===== End of error message =====\n")
             
+            elif msg_type == 'TEMP_RANGE_RESULT':
+                # Let display_temp_range_result handle the formatting
+                # No need to duplicate output here as it's already handled by the callback
+                pass
+                
+            elif msg_type == 'TEMP_RANGE_AVG_RESULT':
+                # Let display_temp_range_avg_result handle the formatting
+                # No need to duplicate output here as it's already handled by the callback
+                pass
+            
             ch.basic_ack(delivery_tag=method.delivery_tag)
             
         except Exception as e:
@@ -377,12 +387,204 @@ class Client(cmd.Cmd):
             return self.do_LOAD(' '.join(parts[1:]))
         elif parts and parts[0].upper() == 'GET':
             return self.do_GET(' '.join(parts[1:]))
+        elif parts and parts[0].upper() == 'TEMP_RANGE':
+            return self.do_temp_range(' '.join(parts[1:]))
+        elif parts and parts[0].upper() == 'TEMP_RANGE_AVG':
+            return self.do_temp_range_avg(' '.join(parts[1:]))
         else:
             print(f"Unknown command: {line}")
-            print("Available commands: LOAD [filename], GET [date], exit")
+            print("Available commands: LOAD [filename], GET [date], TEMP_RANGE [date1] [date2], TEMP_RANGE_AVG [date1] [date2], exit")
 
     def emptyline(self):
         pass
+
+    def do_temp_range(self, arg):
+        """Display temperature data for a date range: TEMP_RANGE start_date end_date"""
+        parts = arg.split()
+        if len(parts) != 2:
+            print("Please provide start_date and end_date. Format: TEMP_RANGE DD-MM-YYYY DD-MM-YYYY")
+            return
+            
+        start_date, end_date = parts
+        
+        # Validate date formats
+        try:
+            self.validate_date_format(start_date)
+            self.validate_date_format(end_date)
+        except ValueError as e:
+            print(f"Date format error: {e}")
+            return
+            
+        print(f"\n===== Getting temperature data for range: {start_date} to {end_date} =====")
+        self.last_response = None
+        
+        try:
+            if self.connection is None or self.connection.is_closed:
+                print("Connection closed, trying to reconnect...")
+                self.init_rabbitmq()
+                
+            # Send TEMP_RANGE request to manager
+            self.send_to_manager(create_message('TEMP_RANGE', {
+                'start_date': start_date,
+                'end_date': end_date
+            }))
+            
+            print("Waiting for response...")
+            for i in range(30):
+                if i % 5 == 0 and i > 0:
+                    print(f"Still waiting for response... {i}/30")
+                    
+                try:
+                    self.connection.process_data_events(time_limit=0.5)
+                    if self.last_response and self.last_response.get('type') == 'TEMP_RANGE_RESULT':
+                        self.display_temp_range_result(self.last_response.get('data', {}))
+                        break
+                except pika.exceptions.AMQPError as e:
+                    print(f"Error processing event: {e}")
+                    try:
+                        self.init_rabbitmq()
+                    except Exception as conn_err:
+                        print(f"Failed to reconnect: {conn_err}")
+                        break
+            
+            if not self.last_response or self.last_response.get('type') != 'TEMP_RANGE_RESULT':
+                print("\n===== No response or incorrect response type received =====")
+                
+        except Exception as e:
+            print(f"Error processing temp_range request: {e}")
+            traceback.print_exc()
+            
+        print("\n===== TEMP_RANGE request completed =====")
+        
+    def do_temp_range_avg(self, arg):
+        """Display average temperature for a date range: TEMP_RANGE_AVG start_date end_date"""
+        parts = arg.split()
+        if len(parts) != 2:
+            print("Please provide start_date and end_date. Format: TEMP_RANGE_AVG DD-MM-YYYY DD-MM-YYYY")
+            return
+            
+        start_date, end_date = parts
+        
+        # Validate date formats
+        try:
+            self.validate_date_format(start_date)
+            self.validate_date_format(end_date)
+        except ValueError as e:
+            print(f"Date format error: {e}")
+            return
+            
+        print(f"\n===== Getting average temperature for range: {start_date} to {end_date} =====")
+        self.last_response = None
+        
+        try:
+            if self.connection is None or self.connection.is_closed:
+                print("Connection closed, trying to reconnect...")
+                self.init_rabbitmq()
+                
+            # Send TEMP_RANGE_AVG request to manager
+            self.send_to_manager(create_message('TEMP_RANGE_AVG', {
+                'start_date': start_date,
+                'end_date': end_date
+            }))
+            
+            print("Waiting for response...")
+            for i in range(30):
+                if i % 5 == 0 and i > 0:
+                    print(f"Still waiting for response... {i}/30")
+                    
+                try:
+                    self.connection.process_data_events(time_limit=0.5)
+                    if self.last_response and self.last_response.get('type') == 'TEMP_RANGE_AVG_RESULT':
+                        self.display_temp_range_avg_result(self.last_response.get('data', {}))
+                        break
+                except pika.exceptions.AMQPError as e:
+                    print(f"Error processing event: {e}")
+                    try:
+                        self.init_rabbitmq()
+                    except Exception as conn_err:
+                        print(f"Failed to reconnect: {conn_err}")
+                        break
+            
+            if not self.last_response or self.last_response.get('type') != 'TEMP_RANGE_AVG_RESULT':
+                print("\n===== No response or incorrect response type received =====")
+                
+        except Exception as e:
+            print(f"Error processing temp_range_avg request: {e}")
+            traceback.print_exc()
+            
+        print("\n===== TEMP_RANGE_AVG request completed =====")
+    
+    def validate_date_format(self, date_str):
+        """Validate date format - accepts DD-MM-YYYY, YYYY-MM-DD, YYYYMMDD"""
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', date_str):
+            day, month, year = map(int, date_str.split('-'))
+            if not is_valid_date(year, month, day):
+                raise ValueError(f"Invalid date: {date_str}")
+        elif re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            year, month, day = map(int, date_str.split('-'))
+            if not is_valid_date(year, month, day):
+                raise ValueError(f"Invalid date: {date_str}")
+        elif re.match(r'^\d{8}$', date_str):
+            year = int(date_str[0:4])
+            month = int(date_str[4:6])
+            day = int(date_str[6:8])
+            if not is_valid_date(year, month, day):
+                raise ValueError(f"Invalid date: {date_str}")
+        else:
+            raise ValueError("Unrecognized date format, supported formats: DD-MM-YYYY, YYYY-MM-DD, YYYYMMDD")
+    
+    def display_temp_range_result(self, data):
+        """Display temperature range results in a formatted way"""
+        if not data.get('success', False):
+            error = data.get('error', 'Unknown error')
+            print(f"\nError retrieving temperature range data: {error}")
+            return
+            
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        daily_temps = data.get('daily_data', {})
+        min_temp = data.get('min')
+        max_temp = data.get('max')
+        count = data.get('count', 0)
+        
+        print(f"\n===== Temperature data from {start_date} to {end_date} =====")
+        print(f"Days with temperature data: {count}")
+        
+        if count > 0:
+            print(f"Temperature range: {min_temp:.2f}°C to {max_temp:.2f}°C")
+            
+            print("\nDaily temperatures:")
+            print("-" * 50)
+            print(f"{'Date':<12} | {'Temperature (°C)':<15}")
+            print("-" * 50)
+            
+            for date, temp in sorted(daily_temps.items()):
+                print(f"{date:<12} | {temp:.2f}°C")
+                
+            print("-" * 50)
+        else:
+            print("No temperature data available for this date range.")
+    
+    def display_temp_range_avg_result(self, data):
+        """Display temperature range average results in a formatted way"""
+        if not data.get('success', False):
+            error = data.get('error', 'Unknown error')
+            print(f"\nError retrieving average temperature: {error}")
+            return
+            
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        avg_temp = data.get('avg_temperature')
+        days_with_data = data.get('days_with_data', 0)
+        total_days = data.get('total_days', 0)
+        
+        print(f"\n===== Average Temperature from {start_date} to {end_date} =====")
+        print(f"Days with data: {days_with_data} out of {total_days} days")
+        
+        if days_with_data > 0:
+            print(f"Average temperature: {avg_temp:.2f}°C")
+        else:
+            print("No temperature data available for this date range.")
 
     def get_data(self, date):
         print(f"Getting data for date: {date}...")

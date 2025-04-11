@@ -1,0 +1,58 @@
+/* 
+在manager.py文件中需要添加的代码：
+
+1. 在__init__方法中添加datamart属性：
+在self.verbose = verbose这一行之后添加：
+        self.datamart = None  # 数据集市进程
+
+2. 在start_keepers()方法调用之后添加start_datamart()调用：
+        self.start_keepers()
+        self.start_datamart()  # 启动数据集市
+
+3. 在文件末尾，log方法之后、if __name__语句之前，添加以下两个方法：
+
+    def start_datamart(self):
+        """启动数据集市进程"""
+        python_executable = sys.executable
+        print(f"Starting DataMart process using Python interpreter: {python_executable}")
+        
+        # 启动datamart进程
+        datamart_process = subprocess.Popen(
+            [python_executable, 'datamart.py']
+        )
+        self.datamart = datamart_process
+        print(f"DataMart process started")
+        
+    def send_to_datamart(self, message):
+        """发送消息到数据集市"""
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=DATAMART_QUEUE,
+                body=message
+            )
+            self.log(f"Sent message to DataMart: {message[:50]}...")
+        except Exception as e:
+            print(f"Error sending message to DataMart: {e}")
+            traceback.print_exc()
+
+4. 在handle_load方法中，在成功加载数据后添加向DataMart发送数据的代码
+在处理完所有keeper的正常数据分发之后，添加：
+
+            # 将加载的数据发送给DataMart
+            try:
+                # 对于DataMart，发送整个文件的数据供温度分析
+                datamart_data = {
+                    'type': 'NEW_DATA',
+                    'data': records,
+                    'file_format': os.path.basename(filename),
+                    'date_column': date_column,
+                    'column_names': column_names
+                }
+                
+                self.send_to_datamart(json.dumps(datamart_data))
+                print(f"Sent data to DataMart for temperature analysis")
+            except Exception as e:
+                print(f"Error sending data to DataMart: {e}")
+                traceback.print_exc()
+*/

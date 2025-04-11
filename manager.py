@@ -28,10 +28,12 @@ class Manager:
         self.health_check_thread = None
         self.health_check_running = False
         self.verbose = verbose  # 是否启用详细日志输出
+        self.datamart = None    # DataMart process for temperature data analysis
 
         self.init_rabbitmq()
         
         self.start_keepers()
+        self.start_datamart()  # Start the DataMart process
         
         # Start health check thread
         self.start_health_check()
@@ -94,6 +96,10 @@ class Manager:
                 self.handle_load(data)
             elif command == 'GET':
                 self.handle_get(data)
+            elif command == 'TEMP_RANGE':
+                self.handle_temp_range(data, properties)
+            elif command == 'TEMP_RANGE_AVG':
+                self.handle_temp_range_avg(data, properties)
             else:
                 self.send_to_client(create_message('ERROR', f"Unknown command: {command}"))
         except Exception as e:
@@ -274,6 +280,29 @@ class Manager:
                     print(f"No available keeper found for date: {date}")
             
             print(f"All data sent to keepers. Processed {dates_processed}/{total_dates} dates")
+            
+            # Send data to DataMart for temperature analysis
+            try:
+                print(f"Sending data to DataMart for temperature analysis...")
+                
+                # Send each date's data to the DataMart
+                for date, date_data in date_records.items():
+                    # Create data object for the DataMart
+                    datamart_data = {
+                        'date': date,
+                        'data': date_data['data'],
+                        'column_names': date_data['column_names'],
+                        'source_file': filename
+                    }
+                    
+                    # Send the data to the DataMart
+                    self.send_to_datamart(create_message('NEW_DATA', datamart_data))
+                
+                print(f"All data sent to DataMart for temperature analysis")
+            except Exception as e:
+                print(f"Error sending data to DataMart: {e}")
+                traceback.print_exc()
+                # Continue with the load operation even if DataMart update fails
             
             # 发送最终完成的通知
             print(f"Sending completion notification to client for file: {filename}")
@@ -1703,6 +1732,121 @@ class Manager:
         """根据verbose设置打印日志"""
         if self.verbose or force:
             print(message)
+
+    def handle_temp_range(self, data, properties):
+        """Handle temperature range query from client"""
+        try:
+            if not isinstance(data, dict) or 'start_date' not in data or 'end_date' not in data:
+                self.send_to_client(create_message('TEMP_RANGE_RESULT', {
+                    'success': False,
+                    'error': 'Invalid request format. Expected: {"start_date": "DD-MM-YYYY", "end_date": "DD-MM-YYYY"}'
+                }))
+                return
+                
+            # 使用标准化日期
+            start_date = data.get('start_date')
+            end_date = data.get('end_date')
+            
+            try:
+                # 验证日期格式
+                std_start = self.standardize_date(start_date)
+                std_end = self.standardize_date(end_date)
+                
+                if not std_start or not std_end:
+                    self.send_to_client(create_message('TEMP_RANGE_RESULT', {
+                        'success': False,
+                        'error': f'Invalid date format: {start_date} or {end_date}'
+                    }))
+                    return
+            except Exception as e:
+                self.send_to_client(create_message('TEMP_RANGE_RESULT', {
+                    'success': False,
+                    'error': f'Date parsing error: {str(e)}'
+                }))
+                return
+                
+            # Forward the request to DataMart - 直接发送，不需要回复属性
+            self.log(f"Forwarding temperature range request to DataMart: {start_date} to {end_date}")
+            self.send_to_datamart(create_message('TEMP_RANGE', data))
+            
+        except Exception as e:
+            self.log(f"Error handling temperature range request: {str(e)}")
+            self.send_to_client(create_message('TEMP_RANGE_RESULT', {
+                'success': False,
+                'error': f"Failed to process temperature range request: {str(e)}"
+            }))
+            
+    def handle_temp_range_avg(self, data, properties):
+        """Handle average temperature for a date range query from client"""
+        try:
+            if not isinstance(data, dict) or 'start_date' not in data or 'end_date' not in data:
+                self.send_to_client(create_message('TEMP_RANGE_AVG_RESULT', {
+                    'success': False,
+                    'error': 'Invalid request format. Expected: {"start_date": "DD-MM-YYYY", "end_date": "DD-MM-YYYY"}'
+                }))
+                return
+                
+            # 使用标准化日期
+            start_date = data.get('start_date')
+            end_date = data.get('end_date')
+            
+            try:
+                # 验证日期格式
+                std_start = self.standardize_date(start_date)
+                std_end = self.standardize_date(end_date)
+                
+                if not std_start or not std_end:
+                    self.send_to_client(create_message('TEMP_RANGE_AVG_RESULT', {
+                        'success': False,
+                        'error': f'Invalid date format: {start_date} or {end_date}'
+                    }))
+                    return
+            except Exception as e:
+                self.send_to_client(create_message('TEMP_RANGE_AVG_RESULT', {
+                    'success': False,
+                    'error': f'Date parsing error: {str(e)}'
+                }))
+                return
+                
+            # Forward the request to DataMart - 直接发送，不需要回复属性
+            self.log(f"Forwarding temperature range average request to DataMart: {start_date} to {end_date}")
+            self.send_to_datamart(create_message('TEMP_RANGE_AVG', data))
+            
+        except Exception as e:
+            self.log(f"Error handling temperature range average request: {str(e)}")
+            self.send_to_client(create_message('TEMP_RANGE_AVG_RESULT', {
+                'success': False,
+                'error': f"Failed to process temperature range average request: {str(e)}"
+            }))
+            
+    def send_to_datamart(self, message, properties=None):
+        """Send message to the DataMart"""
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=DATAMART_QUEUE,
+                body=message
+            )
+            self.log(f"Sent message to DataMart")
+        except Exception as e:
+            self.log(f"Error sending message to DataMart: {str(e)}")
+            raise
+
+    def start_datamart(self):
+        """Start the DataMart process for temperature data analysis"""
+        python_executable = sys.executable
+        print(f"Starting DataMart process using Python interpreter: {python_executable}")
+        
+        # Start the datamart process with the same verbosity setting as the manager
+        datamart_process = subprocess.Popen(
+            [python_executable, 'datamart.py', 
+             '--verbose' if self.verbose else '--quiet']
+        )
+        self.datamart = datamart_process
+        print(f"DataMart process started")
+        
+        # Give the DataMart time to initialize
+        time.sleep(2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Start the distributed storage system manager')
